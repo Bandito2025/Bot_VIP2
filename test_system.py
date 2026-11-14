@@ -556,6 +556,148 @@ async def test_live_panels():
 
 
 # ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 12. ТЕСТ ОГРАНИЧЕНИЯ ТРИАЛА И ПОДПИСКИ НА КАНАЛ
+# ------------------------------------------------------------------------------
+async def test_trial_protection():
+    print("\n🎁 12. Тест защиты триала и подписки на новостной канал...")
+    try:
+        from bot import is_trial_used, get_user_trial_lock, verify_trial_channel_subscription
+        
+        # 1. Проверка для пользователя без ключей и trial_used=0
+        test_uid = 99998881
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO users (user_id, trial_used) VALUES (?, 0)", (test_uid,))
+            conn.execute("DELETE FROM user_keys WHERE user_id = ?", (test_uid,))
+            conn.commit()
+            
+        used_before = is_trial_used(test_uid)
+        report_step("Новый пользователь: триал доступен", not used_before, f"is_trial_used={used_before}")
+
+        # 2. Проверка после установки trial_used = 1
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (test_uid,))
+            conn.commit()
+        used_after = is_trial_used(test_uid)
+        report_step("Пользователь с trial_used=1: триал заблокирован", used_after, f"is_trial_used={used_after}")
+
+        # 3. Проверка для пользователя с существующим ключом (даже если trial_used=0)
+        test_uid_2 = 99998882
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO users (user_id, trial_used) VALUES (?, 0)", (test_uid_2,))
+            conn.execute("INSERT INTO user_keys (user_id, server_id, client_uuid, is_active) VALUES (?, 1, 'mock-uuid', 1)", (test_uid_2,))
+            conn.commit()
+        used_with_key = is_trial_used(test_uid_2)
+        report_step("Пользователь с существующим ключом: триал заблокирован", used_with_key, f"is_trial_used={used_with_key}")
+
+        # 4. Проверка per-user lock
+        lock1 = get_user_trial_lock(test_uid)
+        lock2 = get_user_trial_lock(test_uid)
+        lock3 = get_user_trial_lock(test_uid_2)
+        report_step("Изоляция asyncio.Lock на пользователя", (lock1 is lock2) and (lock1 is not lock3), "Уникальный Lock для каждого user_id")
+
+        # Cleanup
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM users WHERE user_id IN (?, ?)", (test_uid, test_uid_2))
+            conn.execute("DELETE FROM user_keys WHERE user_id IN (?, ?)", (test_uid, test_uid_2))
+            conn.commit()
+
+    except Exception as e:
+        report_step("Тест защиты триала", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 13. ТЕСТ ВИЗАРДА СЕРВЕРОВ WPP И ГИБРИДНОГО РЕЖИМА
+# ------------------------------------------------------------------------------
+async def test_server_wizard_wpp_hybrid():
+    print("\n⚡ 13. Тест визарда серверов WPP и гибридного режима...")
+    try:
+        import server_wizard
+        
+        # 1. Сохранение WPP-ноды
+        ok_wpp = server_wizard.save_server_record(
+            name="Test WPP Node",
+            host="123.45.67.89:8000",
+            panel_type="wpp",
+            wpp_url="http://123.45.67.89:8000",
+            wpp_token="TEST_BEARER_TOKEN",
+            group_name="VIP"
+        )
+        report_step("Сохранение сервера с panel_type='wpp'", ok_wpp)
+
+        # 2. Сохранение гибридной ноды (3X-UI + WPP)
+        ok_both = server_wizard.save_server_record(
+            name="Test Both Node",
+            host="123.45.67.90:2053",
+            panel_url="https://123.45.67.90:2053/secret/",
+            login="api_token",
+            password="XUI_SECRET_TOKEN",
+            panel_type="both",
+            wpp_url="http://123.45.67.90:8000",
+            wpp_token="WPP_SECRET_TOKEN",
+            group_name="Стандарт"
+        )
+        report_step("Сохранение сервера с panel_type='both'", ok_both)
+
+        # 3. Проверка сохранённых данных в базе
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row_wpp = conn.execute("SELECT * FROM servers WHERE name = 'Test WPP Node'").fetchone()
+            row_both = conn.execute("SELECT * FROM servers WHERE name = 'Test Both Node'").fetchone()
+
+        wpp_valid = bool(row_wpp and row_wpp["panel_type"] == "wpp" and row_wpp["wpp_token"] == "TEST_BEARER_TOKEN" and row_wpp["group_name"] == "VIP")
+        both_valid = bool(row_both and row_both["panel_type"] == "both" and row_both["panel_url"].startswith("https://") and row_both["wpp_token"] == "WPP_SECRET_TOKEN")
+        report_step("Корректность реквизитов WPP и 3X-UI в БД", wpp_valid and both_valid, f"WPP ok: {bool(row_wpp)}, Both ok: {bool(row_both)}")
+
+        # 4. Проверка тестовой функции WPP (валидация пустого URL)
+        ok_empty, msg_empty, _ = server_wizard.test_wpp_connection_sync("", "")
+        report_step("Проверка валидации пустого URL WPP", not ok_empty, msg_empty)
+
+        # Cleanup
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM servers WHERE name IN ('Test WPP Node', 'Test Both Node')")
+            conn.commit()
+
+    except Exception as e:
+        report_step("Тест визарда WPP и гибрида", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 14. ТЕСТ ДИНАМИЧЕСКИХ ТАРИФОВ И СТАРТОВОГО ЧЕКЛИСТА
+# ------------------------------------------------------------------------------
+async def test_dynamic_tariffs_and_start_checklist():
+    print("\n📋 14. Тест динамических тарифов и стартового чеклиста /start...")
+    try:
+        from bot import build_tariffs_block, build_custom_start_content
+        
+        # 1. Проверка динамического блока тарифов
+        t_block = build_tariffs_block()
+        report_step("Генерация блока тарифов build_tariffs_block()", bool(t_block) and "Тарифы" in t_block, t_block[:80])
+
+        # 2. Проверка вызова build_custom_start_content для обычного пользователя
+        caption, kb = build_custom_start_content(user_id=12345678)
+        report_step("Формирование контента /start для клиента", bool(caption) and bool(kb), f"Кнопок: {len(kb.inline_keyboard)}")
+
+        # 3. Проверка скрытия кнопки триала при trial_used=1
+        test_uid = 99997771
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO users (user_id, trial_used) VALUES (?, 1)", (test_uid,))
+            conn.commit()
+        caption_u, kb_u = build_custom_start_content(user_id=test_uid)
+        trial_btn_present = any(
+            any(btn.callback_data == "claim_trial" for btn in row)
+            for row in kb_u.inline_keyboard
+        )
+        report_step("Кнопка триала скрыта для пользователя с trial_used=1", not trial_btn_present, "Кнопка 'claim_trial' отсутствует")
+
+        # Cleanup
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM users WHERE user_id = ?", (test_uid,))
+            conn.commit()
+
+    except Exception as e:
+        report_step("Тест динамических тарифов и чеклиста", False, f"Исключение: {e}")
+
 # MAIN RUNNER
 # ------------------------------------------------------------------------------
 async def main():
@@ -574,6 +716,9 @@ async def main():
     await test_bot_handlers_integrity()
     await test_background_jobs()
     await test_url_normalization()
+    await test_trial_protection()
+    await test_server_wizard_wpp_hybrid()
+    await test_dynamic_tariffs_and_start_checklist()
     await test_live_panels()
 
     print("\n" + "=" * 70)

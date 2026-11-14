@@ -101,6 +101,7 @@ def auto_heal_sub_database(db_path: str = DB_PATH):
 def normalize_sub_base_url(raw: str) -> str:
     """
     Преобразует произвольный хост/URL в стандартный формат https://HOST:8443.
+    - Очищает любые дублирующиеся протоколы: https://https:// -> https://
     - Голый IPv4 (177.202.68.108)        → https://177-202-68-108.sslip.io:8443
     - Домен без схемы (sub.domain.com)   → https://sub.domain.com:8443
     - https://... без кастомного порта   → добавляет :8443
@@ -108,31 +109,32 @@ def normalize_sub_base_url(raw: str) -> str:
     """
     if not raw:
         return raw
-    raw = raw.strip().rstrip('/')
-    if ':8443' in raw:
-        if not raw.startswith('https://'):
-            raw = 'https://' + raw.lstrip('http://').lstrip('https://')
+    cleaned = raw.strip().rstrip('/')
+    cleaned = re.sub(r'^(https?://)+', '', cleaned, flags=re.IGNORECASE).strip().rstrip('/')
+    if not cleaned:
         return raw
-    host = raw
-    for prefix in ('https://', 'http://'):
-        if host.startswith(prefix):
-            host = host[len(prefix):]
-            break
-    host = host.split('/')[0].split(':')[0]
+
+    if ':8443' in cleaned:
+        res = f'https://{cleaned}'
+        return re.sub(r'^(https?://)+', 'https://', res, flags=re.IGNORECASE)
+
+    host = cleaned.split('/')[0].split(':')[0]
     if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', host) and host not in ('127.0.0.1', 'localhost'):
         sslip = host.replace('.', '-') + '.sslip.io'
         return f'https://{sslip}:8443'
     if host in ('localhost', '127.0.0.1'):
-        return raw
+        return f'http://{cleaned}' if 'http' in raw else cleaned
     return f'https://{host}:8443'
 
 
 def get_clean_sub_url(sub_id: str, db_path: str = DB_PATH) -> str:
-    """Формирует чистый HTTPS URL подписки с портом 8443"""
+    """Формирует чистый HTTPS URL подписки с портом 8443 без дублирования протоколов"""
+    clean_sub_id = str(sub_id).strip().strip('/')
     env_sub = os.getenv("SUB_BASE_URL", "").strip()
     if env_sub:
         norm_base = normalize_sub_base_url(env_sub).rstrip("/")
-        return f"{norm_base}/sub/{sub_id}"
+        full = f"{norm_base}/sub/{clean_sub_id}"
+        return re.sub(r'^(https?://)+', 'https://', full, flags=re.IGNORECASE)
 
     prefix = ""
     try:
@@ -155,7 +157,8 @@ def get_clean_sub_url(sub_id: str, db_path: str = DB_PATH) -> str:
     if not prefix.endswith("/sub"):
         prefix = prefix + "/sub"
 
-    return f"{prefix}/{sub_id}"
+    full = f"{prefix}/{clean_sub_id}"
+    return re.sub(r'^(https?://)+', 'https://', full, flags=re.IGNORECASE)
 
 
 def build_subscription_payload(sub_id: str, headers: dict = None, query: str = "", client_ip: str = "127.0.0.1", db_path: str = None) -> tuple[int, dict, bytes]:
@@ -371,6 +374,11 @@ class SubServerHandler(BaseHTTPRequestHandler):
 def start_sub_server(port: int = 2097, db_path: str = DB_PATH):
     global DB_PATH
     DB_PATH = db_path
+    try:
+        from migrate_db import run_migrations
+        run_migrations(db_path)
+    except Exception as e:
+        logger.warning(f"sub_server migration notice: {e}")
     auto_heal_sub_database(db_path)
 
     def run():

@@ -18,74 +18,10 @@ def get_db_connection(db_path=None, timeout=30.0):
 
 def auto_migrate_db(db_path=None):
     """Автоматическая миграция: проверяет и добавляет отсутствующие колонки и таблицы во все базы"""
-    import sqlite3, os
-    target = db_path or (DB_PATH if "DB_PATH" in globals() else os.path.join(BASE_DIR, "bot_data.db"))
-    if not os.path.exists(target):
-        return
     try:
-        with get_db_connection(target) as conn:
-            cur = conn.cursor()
-            
-            # 1. Таблица привязки профилей нод (user_key_nodes)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_key_nodes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    key_id INTEGER NOT NULL,
-                    server_id INTEGER NOT NULL,
-                    panel_type TEXT DEFAULT '3xui',
-                    remote_id TEXT DEFAULT '',
-                    remote_email TEXT DEFAULT '',
-                    up_bytes INTEGER DEFAULT 0,
-                    down_bytes INTEGER DEFAULT 0,
-                    is_active INTEGER DEFAULT 1,
-                    updated_at TEXT,
-                    UNIQUE(key_id, server_id, panel_type)
-                )
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_ukn_key ON user_key_nodes(key_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_ukn_srv ON user_key_nodes(server_id)")
-
-            # 2. Проверка user_keys
-            cur.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='user_keys'")
-            if cur.fetchone()[0] > 0:
-                cols = [c[1] for c in cur.execute("PRAGMA table_info(user_keys)").fetchall()]
-                needed_k = {
-                    "group_name": "TEXT DEFAULT ''",
-                    "server_id": "INTEGER DEFAULT NULL",
-                    "location_name": "TEXT DEFAULT ''",
-                    "limit_gb": "REAL DEFAULT 0",
-                    "limit_ip": "INTEGER DEFAULT 1",
-                    "traffic_bytes": "INTEGER DEFAULT 0",
-                    "history_log": "TEXT DEFAULT ''",
-                    "sub_id": "TEXT DEFAULT ''",
-                    "config_text": "TEXT DEFAULT ''"
-                }
-                for c_name, c_def in needed_k.items():
-                    if c_name not in cols:
-                        cur.execute(f"ALTER TABLE user_keys ADD COLUMN {c_name} {c_def}")
-
-            # 3. Проверка servers
-            cur.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='servers'")
-            if cur.fetchone()[0] > 0:
-                s_cols = [c[1] for c in cur.execute("PRAGMA table_info(servers)").fetchall()]
-                needed_s = {
-                    "group_name": "TEXT DEFAULT 'Стандарт'",
-                    "panel_type": "TEXT DEFAULT 'both'",
-                    "wpp_token": "TEXT DEFAULT ''",
-                    "wpp_url": "TEXT DEFAULT ''"
-                }
-                for c_name, c_def in needed_s.items():
-                    if c_name not in s_cols:
-                        cur.execute(f"ALTER TABLE servers ADD COLUMN {c_name} {c_def}")
-
-            # 4. Проверка tariffs
-            cur.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tariffs'")
-            if cur.fetchone()[0] > 0:
-                t_cols = [c[1] for c in cur.execute("PRAGMA table_info(tariffs)").fetchall()]
-                if "group_name" not in t_cols:
-                    cur.execute("ALTER TABLE tariffs ADD COLUMN group_name TEXT DEFAULT 'Стандарт'")
-
-            conn.commit()
+        from migrate_db import run_migrations
+        target = db_path or (DB_PATH if "DB_PATH" in globals() else os.path.join(BASE_DIR, "bot_data.db"))
+        run_migrations(target)
     except Exception as e:
         import logging
         logging.getLogger("Bot_VIP").warning(f"auto_migrate_db notice: {e}")
@@ -431,6 +367,7 @@ SUB_PORT = int(os.getenv("SUB_PORT", "2097"))
 def normalize_sub_base_url(raw: str) -> str:
     """
     Преобразует произвольный хост/URL в стандартный формат https://HOST:8443.
+    - Очищает любые дублирующиеся протоколы: https://https:// -> https://
     - Голый IPv4 (177.202.68.108)        → https://177-202-68-108.sslip.io:8443
     - Домен без схемы (sub.domain.com)   → https://sub.domain.com:8443
     - https://... без кастомного порта   → добавляет :8443
@@ -438,22 +375,21 @@ def normalize_sub_base_url(raw: str) -> str:
     """
     if not raw:
         return raw
-    raw = raw.strip().rstrip('/')
-    if ':8443' in raw:
-        if not raw.startswith('https://'):
-            raw = 'https://' + raw.lstrip('http://').lstrip('https://')
+    cleaned = raw.strip().rstrip('/')
+    cleaned = re.sub(r'^(https?://)+', '', cleaned, flags=re.IGNORECASE).strip().rstrip('/')
+    if not cleaned:
         return raw
-    host = raw
-    for prefix in ('https://', 'http://'):
-        if host.startswith(prefix):
-            host = host[len(prefix):]
-            break
-    host = host.split('/')[0].split(':')[0]
+
+    if ':8443' in cleaned:
+        res = f'https://{cleaned}'
+        return re.sub(r'^(https?://)+', 'https://', res, flags=re.IGNORECASE)
+
+    host = cleaned.split('/')[0].split(':')[0]
     if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', host) and host not in ('127.0.0.1', 'localhost'):
         sslip = host.replace('.', '-') + '.sslip.io'
         return f'https://{sslip}:8443'
     if host in ('localhost', '127.0.0.1'):
-        return raw
+        return f'http://{cleaned}' if 'http' in raw else cleaned
     return f'https://{host}:8443'
 
 
@@ -1213,6 +1149,74 @@ async def verify_user_subscribed_to_channel(user_id: int, context: ContextTypes.
     except Exception:
         return True, ""
 
+
+_trial_user_locks: dict[int, asyncio.Lock] = {}
+
+def get_user_trial_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in _trial_user_locks:
+        _trial_user_locks[user_id] = asyncio.Lock()
+    return _trial_user_locks[user_id]
+
+def is_trial_used(user_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            row = conn.execute("SELECT trial_used FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            if row and row[0] == 1:
+                return True
+            k_count = conn.execute("SELECT COUNT(*) FROM user_keys WHERE user_id = ?", (user_id,)).fetchone()[0]
+            if k_count > 0:
+                return True
+    except Exception as e:
+        logger.warning(f"is_trial_used check error for {user_id}: {e}")
+    return False
+
+async def verify_trial_channel_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
+    if is_user_admin(user_id) or is_any_admin_ckm(user_id):
+        return True, ""
+    ch = (get_setting("news_channel", "") or get_setting("channel_url", "")).strip()
+    if not ch:
+        return True, ""
+    
+    if ch.startswith("https://t.me/") or ch.startswith("http://t.me/"):
+        slug = ch.split("t.me/")[-1].split("/")[0].strip()
+        chat_id_str = "@" + slug.lstrip("@")
+        ch_link = ch
+    elif ch.startswith("@"):
+        chat_id_str = ch
+        ch_link = f"https://t.me/{ch.lstrip('@')}"
+    elif ch.startswith("-100") or ch.isdigit():
+        chat_id_str = ch
+        ch_link = get_setting("channel_url", "").strip() or f"https://t.me/{ch}"
+    else:
+        chat_id_str = "@" + ch.lstrip("@")
+        ch_link = f"https://t.me/{ch.lstrip('@')}"
+
+    try:
+        member = await context.bot.get_chat_member(chat_id=chat_id_str, user_id=user_id)
+        if member.status in ("left", "kicked"):
+            return False, ch_link
+        return True, ch_link
+    except Exception as e:
+        logger.warning(f"verify_trial_channel_subscription error for user {user_id} on {chat_id_str}: {e}")
+        return True, ch_link
+
+
+def render_news_channel_settings_screen() -> tuple[str, InlineKeyboardMarkup]:
+    cur_ch = get_setting("news_channel", "") or "Не задан"
+    text = (
+        "📢 <b>Настройка новостного канала для триала</b>\n\n"
+        f"Текущий канал: <code>{cur_ch}</code>\n\n"
+        "Если канал задан, бот перед выдачей бесплатного триала проверяет, "
+        "что пользователь подписан на этот канал.\n"
+        "<i>Бот должен быть добавлен администратором в данный канал!</i>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Указать канал (@channel или ссылка)", callback_data="admin_inp_news_chan")],
+        [InlineKeyboardButton("❌ Очистить / Отключить проверку", callback_data="admin_clear_news_chan")],
+        [InlineKeyboardButton("⬅️ Назад в настройки", callback_data="admin_btn_settings")]
+    ])
+    return text, kb
+
 # ==============================================================================
 # 🧩 МОДУЛЬ "ДИАГНОСТИКА РАСШИРЕНИЙ" (ТОЧЬ-В-ТОЧЬ ПО СКРИНШОТУ 9)
 # ==============================================================================
@@ -1866,6 +1870,7 @@ def render_bot_settings_main_screen() -> tuple[str, InlineKeyboardMarkup]:
     buttons = [
         [InlineKeyboardButton("🔄 Обновления", callback_data="admin_bset_updates")],
         [InlineKeyboardButton("🌐 Веб и Mini App", callback_data="admin_bset_webapp")],
+        [InlineKeyboardButton("📢 Новостной канал (для триала)", callback_data="admin_bset_news_chan")],
         [InlineKeyboardButton("📦 Создать бэкап", callback_data="admin_bset_backup")],
         [InlineKeyboardButton("📱 Ограничение устройств", callback_data="admin_bset_devices")],
         [InlineKeyboardButton("✏️ Изменить тексты", callback_data="admin_bset_texts")],
@@ -2852,9 +2857,12 @@ def check_and_expire_vips():
 # 🎨 ИНТЕРФЕЙСЫ И ДАШБОРДЫ
 # ==============================================================================
 def main_keyboard(user_id: int):
+    row2 = ["🎟 Промокод / Купон"]
+    if not is_trial_used(user_id):
+        row2 = ["🎁 Пробная подписка", "🎟 Промокод / Купон"]
     buttons = [
         ["🔑 Мои ключи", "🌐 Купить VPN / Подписка"],
-        ["🎁 Пробная подписка", "🎟 Промокод / Купон"],
+        row2,
         ["🔗 Реферальная программа", "🤖 Купить такого бота"],
         ["👤 Профиль", "📢 Наш канал", "🆘 Поддержка"],
         ["ℹ️ О боте"]
@@ -3774,6 +3782,18 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             t_wiz, kb_wiz = server_wizard.render_wizard_step(context.user_data["srv_wiz"])
             await query.edit_message_text(t_wiz, reply_markup=kb_wiz, parse_mode="HTML")
             return
+        elif data == "admin_srvwiz_wpp":
+            context.user_data["mode"] = "srv_wiz"
+            context.user_data["srv_wiz"] = {"mode": "wpp", "step": 1}
+            t_wiz, kb_wiz = server_wizard.render_wizard_step(context.user_data["srv_wiz"])
+            await query.edit_message_text(t_wiz, reply_markup=kb_wiz, parse_mode="HTML")
+            return
+        elif data == "admin_srvwiz_both":
+            context.user_data["mode"] = "srv_wiz"
+            context.user_data["srv_wiz"] = {"mode": "both", "step": 1}
+            t_wiz, kb_wiz = server_wizard.render_wizard_step(context.user_data["srv_wiz"])
+            await query.edit_message_text(t_wiz, reply_markup=kb_wiz, parse_mode="HTML")
+            return
         elif data == "admin_srvwiz_cancel":
             context.user_data.pop("srv_wiz", None)
             context.user_data.pop("srv_wiz_draft", None)
@@ -3796,12 +3816,24 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif data == "admin_srvwiz_skip":
             wiz = context.user_data.get("srv_wiz")
-            if wiz and wiz.get("step") == 3:
-                wiz["group_id"] = 0
-                wiz["group_label"] = "Все inbound’ы"
-                wiz["step"] = 4
-                t_wiz, kb_wiz = server_wizard.render_wizard_step(wiz)
-                await query.edit_message_text(t_wiz, reply_markup=kb_wiz, parse_mode="HTML")
+            if wiz:
+                if wiz.get("mode") in ("api", "login") and wiz.get("step") == 3:
+                    wiz["group_id"] = 0
+                    wiz["group_label"] = "Все inbound’ы"
+                    wiz["step"] = 4
+                    t_wiz, kb_wiz = server_wizard.render_wizard_step(wiz)
+                    await query.edit_message_text(t_wiz, reply_markup=kb_wiz, parse_mode="HTML")
+                    return
+                elif wiz.get("mode") == "wpp" and wiz.get("step") == 4:
+                    wiz["group_name"] = ""
+                    wiz["group_label"] = "Все тарифы"
+                    await server_wizard.finalize_server_addition(update, context, wiz)
+                    return
+                elif wiz.get("mode") == "both" and wiz.get("step") == 6:
+                    wiz["group_name"] = ""
+                    wiz["group_label"] = "Все тарифы"
+                    await server_wizard.finalize_server_addition(update, context, wiz)
+                    return
             return
         elif data == "admin_srvwiz_retry":
             wiz = context.user_data.get("srv_wiz_draft")
@@ -3930,34 +3962,76 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
         return
 
-    if data in ("client_activate_trial_btn", "claim_trial"):
-        sub_ok, ch_link = await verify_user_subscribed_to_channel(user.id, context)
-        if not sub_ok:
-            kb_sub = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Подписаться на канал", url=ch_link)],
-                [InlineKeyboardButton("✅ Я подписался (Проверить)", callback_data="client_activate_trial_btn")]
-            ])
-            await query.message.reply_text(
-                "📢 <b>Для получения бесплатной пробной подписки подпишитесь на наш официальный канал:</b>",
-                parse_mode="HTML",
-                reply_markup=kb_sub
-            )
+    if data in ("client_activate_trial_btn", "claim_trial", "check_trial_sub"):
+        async with get_user_trial_lock(user.id):
+            if is_trial_used(user.id):
+                try:
+                    await query.answer("🔒 Вы уже активировали пробный период или у вас уже есть подписка.", show_alert=True)
+                except Exception:
+                    pass
+                try:
+                    text_out, kb_out = await render_my_keys_screen(user.id)
+                    await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+                except Exception:
+                    await query.message.reply_text(
+                        "🔒 <b>Вы уже активировали пробный период или у вас уже есть подписка.</b>\n"
+                        "Выберите подходящий тариф в разделе <b>«💳 Купить ключ»</b>.",
+                        parse_mode="HTML"
+                    )
+                return
+
+            if get_setting("trial_enabled", "1") != "1":
+                try:
+                    await query.answer("⚠️ Пробный период временно отключен.", show_alert=True)
+                except Exception:
+                    pass
+                return
+
+            sub_ok, ch_link = await verify_trial_channel_subscription(user.id, context)
+            if not sub_ok:
+                kb_sub = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Подписаться на канал", url=ch_link)],
+                    [InlineKeyboardButton("✅ Я подписался, проверить", callback_data="check_trial_sub")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="client_my_keys")]
+                ])
+                try:
+                    await query.edit_message_text(
+                        "📢 <b>Для получения бесплатной пробной подписки подпишитесь на наш официальный канал:</b>",
+                        parse_mode="HTML",
+                        reply_markup=kb_sub
+                    )
+                except Exception:
+                    await query.message.reply_text(
+                        "📢 <b>Для получения бесплатной пробной подписки подпишитесь на наш официальный канал:</b>",
+                        parse_mode="HTML",
+                        reply_markup=kb_sub
+                    )
+                return
+
+            t_days = int(get_setting("trial_days", "3") or 3)
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (user.id,))
+                conn.commit()
+
+            k_id, until, sub_url, _ = await create_or_extend_user_key(user.id, days=t_days, create_new=True)
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE user_keys SET key_name = ? WHERE id = ?", (f"🎁 Пробный ключ #{k_id}", k_id))
+                    conn.commit()
+            except Exception:
+                pass
+
+            await notify_admin_event(user, "notify_keys", f"🎁 Активация пробного Ключа #{k_id} ({t_days} дн.)", f"До {until}", context)
+            try:
+                await query.answer("🎉 Пробная подписка успешно активирована!", show_alert=True)
+            except Exception:
+                pass
+            text_out, kb_out = await render_my_keys_screen(user.id)
+            try:
+                await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+            except Exception:
+                await query.message.reply_text(text_out, parse_mode="HTML", reply_markup=kb_out)
             return
-        if get_setting("trial_enabled", "1") != "1":
-            await query.message.reply_text("⚠️ Пробный период временно отключен.")
-            return
-        info = get_user_info(user.id)
-        if info and info[13] == 1:
-            await query.message.reply_text("🔒 Вы уже использовали бесплатный пробный период ранее.")
-            return
-        t_days = int(get_setting("trial_days", "3") or 3)
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (user.id,))
-            conn.commit()
-        k_id, until, sub_url, _ = await create_or_extend_user_key(user.id, days=t_days, create_new=True)
-        text_out, kb_out = await render_my_keys_screen(user.id)
-        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
-        return
 
     # ==========================================================================
     # 🛒 КЛИЕНТСКАЯ ВИТРИНА ТАРИФОВ И ОПЛАТЫ
@@ -5433,30 +5507,134 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not srv:
             await query.edit_message_text("Сервер не найден.", reply_markup=admin_dashboard_keyboard())
             return
-        srv_id, name, host, p_type, p_url, p_user, p_pass, inb_id, sub_pref, prx_tpl, is_active = srv
+        srv_id, name, host, p_type, p_url, p_user, p_pass, inb_id, sub_pref, prx_tpl, is_active = srv[:11]
+
+        srv_dict = {}
+        try:
+            with sqlite3.connect(DB_PATH) as _conn:
+                _conn.row_factory = sqlite3.Row
+                _r = _conn.execute("SELECT * FROM servers WHERE id = ?", (srv_id,)).fetchone()
+                if _r:
+                    srv_dict = dict(_r)
+        except Exception:
+            pass
+
+        wpp_url = srv_dict.get("wpp_url") or ""
+        wpp_token = srv_dict.get("wpp_token") or ""
+        group_name = srv_dict.get("group_name") or "Все"
+        p_type = srv_dict.get("panel_type") or p_type or "3xui"
+
         st = await poll_node_live_status(srv)
         status_line = "⏸ Деактивирован" if not is_active else ("🟢 Онлайн" if st["online"] else f"🔴 {st['error']}")
         toggle_label = "⏸ Деактивировать сервер" if is_active else "▶️ Активировать сервер"
 
-        kb = InlineKeyboardMarkup([
+        kb_rows = [
             [InlineKeyboardButton(toggle_label, callback_data=f"admin_srv_toggle_{srv_id}")],
             [InlineKeyboardButton("✏️ Редактировать сервер", callback_data=f"admin_srv_edit_{srv_id}")],
+        ]
+        if wpp_url and wpp_token:
+            kb_rows.append([
+                InlineKeyboardButton("🧪 Тест WPP", callback_data=f"admin_srv_test_wpp_{srv_id}"),
+                InlineKeyboardButton("🔌 Отключить WPP", callback_data=f"admin_srv_unbind_wpp_{srv_id}")
+            ])
+        else:
+            kb_rows.append([
+                InlineKeyboardButton("🟣 Настроить / подключить WPP", callback_data=f"admin_srv_setup_wpp_{srv_id}")
+            ])
+        kb_rows.extend([
             [InlineKeyboardButton("🔗 Задать шаблон VIP Proxy", callback_data=f"admin_srv_tpl_{srv_id}")],
             [InlineKeyboardButton("➕ Загрузить доп. ключи в пул сервера", callback_data=f"admin_add_vpn_{srv_id}")],
             [InlineKeyboardButton("🗑 Удалить сервер", callback_data=f"admin_srv_del_{srv_id}")],
             [InlineKeyboardButton("⬅️ Назад к списку серверов", callback_data="admin_servers_menu")]
         ])
+        kb = InlineKeyboardMarkup(kb_rows)
+
+        wpp_status_str = f"⚡ <b>WPP:</b> подключен (<code>{html.escape(wpp_url)}</code>)" if (wpp_url and wpp_token) else "⚡ <b>WPP:</b> не подключен"
+
         await query.edit_message_text(
             f"🖥 <b>Управление сервером #{srv_id}: {html.escape(name)}</b>\n\n"
             f"🌐 <b>Хост:</b> <code>{html.escape(host)}</code>\n"
             f"🔌 <b>Режим:</b> <code>{html.escape(p_type)}</code> (Inbound ID: <code>{inb_id}</code>)\n"
             f"🔗 <b>URL панели:</b> <code>{html.escape(p_url or 'TCP/Proxy режим')}</code>\n"
+            f"{wpp_status_str}\n"
+            f"🏷 <b>Группа тарифов:</b> <code>{html.escape(group_name)}</code>\n"
             f"📡 <b>Статус:</b> {html.escape(status_line)}\n"
             f"🔑 <b>Онлайн:</b> {st.get('clients_online', 0)} | 📊 <b>Трафик:</b> {st.get('traffic_str', '0 GB')}\n"
             f"🧩 <b>Шаблон Proxy 2.7.0:</b> <code>{html.escape(prx_tpl or 'Авто VLESS+WS')}</code>",
             parse_mode="HTML",
             reply_markup=kb
         )
+        return
+
+    if data.startswith("admin_srv_setup_wpp_"):
+        srv_id = int(data.split("_")[-1])
+        context.user_data["mode"] = "input_server_wpp"
+        context.user_data["target_server_id"] = srv_id
+        await query.edit_message_text(
+            f"🟣 <b>Подключение WPP (Web-Panel-Proxy) к серверу #{srv_id}</b>\n\n"
+            f"Отправьте URL панели WPP и API-токен через пробел (или с новой строки):\n"
+            f"<code>http://123.45.67.89:8000 Bearer_Токен_WPP</code>\n\n"
+            f"<i>Или отправьте только URL панели WPP (токен бот запросит следующим сообщением).</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_srv_view_{srv_id}")]])
+        )
+        return
+
+    if data.startswith("admin_srv_test_wpp_"):
+        srv_id = int(data.split("_")[-1])
+        w_url, w_tok = "", ""
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                r = conn.execute("SELECT wpp_url, wpp_token FROM servers WHERE id = ?", (srv_id,)).fetchone()
+                if r:
+                    w_url = r["wpp_url"] or ""
+                    w_tok = r["wpp_token"] or ""
+        except Exception:
+            pass
+        if not w_url or not w_tok:
+            await query.answer("WPP не настроен для этого сервера.", show_alert=True)
+            return
+        ok, detail, lat = await asyncio.to_thread(server_wizard.test_wpp_connection_sync, w_url, w_tok)
+        if ok:
+            await query.answer(f"🟢 WPP онлайн! Ответ за {lat} ms.", show_alert=True)
+        else:
+            await query.answer(f"🔴 Ошибка WPP: {detail[:150]}", show_alert=True)
+        return
+
+    if data.startswith("admin_srv_unbind_wpp_"):
+        srv_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE servers SET wpp_url = '', wpp_token = '', panel_type = '3xui' WHERE id = ?", (srv_id,))
+            conn.commit()
+        await query.answer("🔌 WPP отключен от сервера.", show_alert=True)
+        srv = get_server_full_by_id(srv_id)
+        if srv:
+            text_out, kb_out = await render_servers_monitor_screen()
+            await query.edit_message_text(f"🔌 WPP отключен от сервера #{srv_id}.\n\n" + text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_bset_news_chan":
+        text_out, kb_out = render_news_channel_settings_screen()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_inp_news_chan":
+        context.user_data["mode"] = "input_news_channel"
+        await query.edit_message_text(
+            "📢 <b>Укажите новостной канал для триала</b>\n\n"
+            "Отправьте юзернейм канала (например <code>@my_vpn_news</code>) или публичную ссылку (<code>https://t.me/my_vpn_news</code>):\n\n"
+            "<i>Убедитесь, что бот назначен администратором этого канала!</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_bset_news_chan")]])
+        )
+        return
+
+    if data == "admin_clear_news_chan":
+        set_setting("news_channel", "")
+        await query.answer("Новостной канал очищен. Проверка подписки отключена.", show_alert=True)
+        text_out, kb_out = render_news_channel_settings_screen()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
         return
 
     if data.startswith("admin_srv_toggle_"):
@@ -5884,6 +6062,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"✅ Курсы валют обновлены!\n\n{text_out}", parse_mode="HTML", reply_markup=kb_out)
             return
 
+        elif mode == "input_news_channel":
+            context.user_data["mode"] = None
+            val = text.strip()
+            set_setting("news_channel", val)
+            text_out, kb_out = render_news_channel_settings_screen()
+            await msg.reply_text(f"✅ Новостной канал успешно сохранён: <code>{val}</code>\n\n{text_out}", parse_mode="HTML", reply_markup=kb_out)
+            return
+
+        elif mode == "input_server_wpp":
+            srv_id = context.user_data.get("target_server_id")
+            raw = text.strip()
+            parts = raw.split()
+            if len(parts) >= 2:
+                w_url, w_tok = parts[0], parts[1]
+            elif "wpp_pending_url" in context.user_data:
+                w_url = context.user_data.pop("wpp_pending_url")
+                w_tok = raw
+            else:
+                context.user_data["wpp_pending_url"] = raw
+                await msg.reply_text(
+                    "🔑 Теперь отправьте <b>API-токен (Bearer token)</b> панели WPP:",
+                    parse_mode="HTML"
+                )
+                return
+
+            status_msg = await msg.reply_text("⏳ <i>Проверяю связь с WPP-панелью...</i>", parse_mode="HTML")
+            ok, detail, lat = await asyncio.to_thread(server_wizard.test_wpp_connection_sync, w_url, w_tok)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            if not ok:
+                await msg.reply_text(
+                    f"❌ <b>Ошибка подключения к WPP!</b>\n\n"
+                    f"🔗 URL: <code>{w_url}</code>\n"
+                    f"⚠️ Причина: {detail}\n\n"
+                    f"Проверьте URL и токен и попробуйте снова (отправьте URL и токен через пробел):",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад к серверу", callback_data=f"admin_srv_view_{srv_id}")]])
+                )
+                return
+
+            context.user_data["mode"] = None
+            context.user_data.pop("target_server_id", None)
+            with sqlite3.connect(DB_PATH) as _conn:
+                _conn.execute("""
+                    UPDATE servers
+                    SET wpp_url = ?, wpp_token = ?,
+                        panel_type = CASE WHEN panel_url IS NOT NULL AND panel_url != '' THEN 'both' ELSE 'wpp' END
+                    WHERE id = ?
+                """, (w_url, w_tok, srv_id))
+                _conn.commit()
+
+            try:
+                from panel_manager import sync_active_keys_with_servers
+                asyncio.create_task(sync_active_keys_with_servers())
+            except Exception as e:
+                logger.warning(f"Failed to trigger sync_active_keys_with_servers: {e}")
+
+            await msg.reply_text(
+                f"✅ <b>WPP успешно подключен к серверу #{srv_id}!</b>\n\n"
+                f"🔗 URL: <code>{w_url}</code>\n"
+                f"🟢 Связь подтверждена ({lat} ms)\n"
+                f"🔄 Запущена фоновая синхронизация активных ключей с WPP-нодой.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖥 К серверу", callback_data=f"admin_srv_view_{srv_id}")]])
+            )
+            return
+
         elif mode == "edit_trial_days":
             context.user_data["mode"] = None
             if text.strip().isdigit():
@@ -6247,43 +6495,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "🎁 Пробная подписка":
-        sub_ok, ch_link = await verify_user_subscribed_to_channel(user.id, context)
-        if not sub_ok:
-            kb_sub = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Подписаться на канал", url=ch_link)],
-                [InlineKeyboardButton("✅ Я подписался (Проверить)", callback_data="client_activate_trial_btn")]
-            ])
+        async with get_user_trial_lock(user.id):
+            if is_trial_used(user.id):
+                await msg.reply_text(
+                    "🔒 <b>Вы уже активировали пробный период или у вас уже есть подписка.</b>\n"
+                    "Выберите подходящий тариф в разделе <b>«💳 Купить ключ»</b>.",
+                    parse_mode="HTML"
+                )
+                return
+            if get_setting("trial_enabled", "1") != "1":
+                await msg.reply_text("⚠️ Пробный период временно отключен администратором. Выберите тариф в разделе «🌐 Купить VPN / Подписка».")
+                return
+            sub_ok, ch_link = await verify_trial_channel_subscription(user.id, context)
+            if not sub_ok:
+                kb_sub = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Подписаться на канал", url=ch_link)],
+                    [InlineKeyboardButton("✅ Я подписался, проверить", callback_data="check_trial_sub")]
+                ])
+                await msg.reply_text(
+                    "📢 <b>Для получения бесплатной пробной подписки подпишитесь на наш официальный канал:</b>",
+                    parse_mode="HTML",
+                    reply_markup=kb_sub
+                )
+                return
+            t_days = int(get_setting("trial_days", "3") or 3)
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (user.id,))
+                conn.commit()
+            k_id, until, sub_url, _ = await create_or_extend_user_key(user.id, days=t_days, create_new=True)
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE user_keys SET key_name = ? WHERE id = ?", (f"🎁 Пробный ключ #{k_id}", k_id))
+                    conn.commit()
+            except Exception:
+                pass
+            await notify_admin_event(user, "notify_keys", f"🎁 Активация пробного Ключа #{k_id} ({t_days} дн.)", f"До {until}", context)
+            text_out, kb_out = await render_my_keys_screen(user.id)
             await msg.reply_text(
-                "📢 <b>Для получения бесплатной пробной подписки подпишитесь на наш официальный канал:</b>",
+                f"🎁 <b>Пробный Ключ #{k_id} активирован на {t_days} дн.!</b>\n\n{text_out}",
                 parse_mode="HTML",
-                reply_markup=kb_sub
+                reply_markup=kb_out
             )
             return
-        if get_setting("trial_enabled", "1") != "1":
-            await msg.reply_text("⚠️ Пробный период временно отключен администратором. Выберите тариф в разделе «🌐 Купить VPN / Подписка».")
-            return
-        info = get_user_info(user.id)
-        trial_used = info[13] if (info and len(info) > 13) else 0
-        if trial_used == 1:
-            await msg.reply_text(
-                "🔒 <b>Вы уже использовали бесплатный пробный период ранее.</b>\n"
-                "Ваши существующие ключи находятся в разделе <b>«🔑 Мои ключи»</b>.",
-                parse_mode="HTML"
-            )
-            return
-        t_days = int(get_setting("trial_days", "3") or 3)
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (user.id,))
-            conn.commit()
-        k_id, until, sub_url, _ = await create_or_extend_user_key(user.id, days=t_days, create_new=True)
-        await notify_admin_event(user, "notify_keys", f"🎁 Активация пробного Ключа #{k_id} ({t_days} дн.)", f"До {until}", context)
-        text_out, kb_out = await render_my_keys_screen(user.id)
-        await msg.reply_text(
-            f"🎁 <b>Пробный Ключ #{k_id} активирован на {t_days} дн.!</b>\n\n{text_out}",
-            parse_mode="HTML",
-            reply_markup=kb_out
-        )
-        return
 
     if text in ("🌐 Купить VPN / Подписка", "🌐 Мой VPN / Подписка", "🌐 Мой VPN / Купить VPN"):
         info = get_user_info(user.id)
@@ -6448,31 +6701,33 @@ CMS_SECTIONS = {
 
 def build_tariffs_block():
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             cols = [c[1] for c in conn.execute("PRAGMA table_info(tariffs)").fetchall()]
-            act_cond = "AND is_active = 1" if "is_active" in cols else ""
+            where_clauses = []
+            if "is_active" in cols:
+                where_clauses.append("is_active = 1")
+            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            
+            order_clauses = []
+            if "sort_order" in cols:
+                order_clauses.append("sort_order ASC")
+            order_clauses.append("price_rub ASC")
+            order_sql = "ORDER BY " + ", ".join(order_clauses)
+            
             rows = conn.execute(
-                f"SELECT name, price_rub FROM tariffs WHERE is_bot = 0 {act_cond} ORDER BY price_rub ASC"
+                f"SELECT name, price_rub FROM tariffs {where_sql} {order_sql}"
             ).fetchall()
             if rows:
-                lines = ["📋 Тарифы:"]
+                lines = ["📋 <b>Тарифы:</b>"]
                 for name, price in rows:
                     p_str = int(price) if float(price).is_integer() else price
                     lines.append(f"• {name} — {p_str} ₽")
                 return "\n".join(lines)
+            else:
+                return "📋 <i>Тарифы временно обновляются администратором.</i>"
     except Exception as e:
-        import logging
-        logging.error(f"build_tariffs_block error: {e}")
-    return (
-        "📋 Тарифы:\n"
-        "• 📱 Акция 30дней 2Устроиства — 150 ₽\n"
-        "• 📱 30 Дней 1 Устр. — 199 ₽\n"
-        "• 📱 Акция 60дней 2Устроиства — 250 ₽\n"
-        "• 📱 60 Дней 1 Устр. — 350 ₽\n"
-        "• 📱 90 Дней 1 Устр. — 500 ₽\n"
-        "• 📱 180 Дней 1 Устр. — 999 ₽\n"
-        "• 📱 365 Дней 1 Устр. — 1790 ₽"
-    )
+        logger.warning(f"build_tariffs_block error: {e}")
+        return "📋 <i>Тарифы временно обновляются администратором.</i>"
 
 def build_custom_start_content(user_id: int):
     raw_tpl = get_setting("cms_main_text", "")
@@ -6487,20 +6742,41 @@ def build_custom_start_content(user_id: int):
         )
     caption = raw_tpl.replace("%тарифы%", build_tariffs_block())
 
-    rows = [
-        [
-            InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys"),
-            InlineKeyboardButton("💳 Купить ключ", callback_data="order_vpn")
-        ],
-        [
+    # Проверка: администратор и 0 активных серверов -> стартовый чеклист настройки
+    is_admin = is_user_admin(user_id) or is_any_admin_ckm(user_id)
+    active_srv_count = 0
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            active_srv_count = conn.execute("SELECT COUNT(*) FROM servers WHERE is_active = 1").fetchone()[0]
+    except Exception:
+        pass
+
+    rows = []
+    if is_admin and active_srv_count == 0:
+        checklist_text = (
+            "\n\n🚀 <b>Быстрый старт администратора:</b>\n"
+            "1. [ ] Подключите VPN-сервер (3X-UI или WPP)\n"
+            "2. [ ] Настройте тарифы под ваши цены\n"
+            "3. [ ] Укажите новостной канал для триала"
+        )
+        caption += checklist_text
+        rows.append([InlineKeyboardButton("➕ Подключить первый сервер", callback_data="admin_srv_add")])
+
+    rows.append([
+        InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys"),
+        InlineKeyboardButton("💳 Купить ключ", callback_data="order_vpn")
+    ])
+
+    if not is_trial_used(user_id):
+        rows.append([
             InlineKeyboardButton("🎁 Пробная подписка", callback_data="claim_trial")
-        ],
-        [
-            InlineKeyboardButton("🔗 Реферальная ссылка", callback_data="start_ref_link"),
-            InlineKeyboardButton("❓ Справка", callback_data="start_help_box")
-        ]
-    ]
-    if is_any_admin_ckm(user_id):
+        ])
+
+    rows.append([
+        InlineKeyboardButton("🔗 Реферальная ссылка", callback_data="start_ref_link"),
+        InlineKeyboardButton("❓ Справка", callback_data="start_help_box")
+    ])
+    if is_admin:
         rows.append([InlineKeyboardButton("⚙️ Админ-панель", callback_data="start_open_admin")])
 
     return caption, InlineKeyboardMarkup(rows)
@@ -6540,17 +6816,24 @@ def render_client_keys_list_screen(user_id: int) -> tuple[str, InlineKeyboardMar
         ).fetchall()
 
     if not rows:
-        txt = (
-            "🔑 <b>Мои ключи</b>\n\n"
-            "У вас пока нет активных VPN-ключей.\n"
-            "Нажмите <b>«💳 Купить ключ»</b> или активируйте <b>«🎁 Пробную подписку»</b>!"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Купить ключ", callback_data="order_vpn")],
-            [InlineKeyboardButton("🎁 Пробная подписка", callback_data="claim_trial")],
-            [InlineKeyboardButton("🈴 На главную", callback_data="start_back_main")]
-        ])
-        return txt, kb
+        btns = [
+            [InlineKeyboardButton("💳 Купить ключ", callback_data="order_vpn")]
+        ]
+        if not is_trial_used(user_id):
+            txt = (
+                "🔑 <b>Мои ключи</b>\n\n"
+                "У вас пока нет активных VPN-ключей.\n"
+                "Нажмите <b>«💳 Купить ключ»</b> или активируйте <b>«🎁 Пробную подписку»</b>!"
+            )
+            btns.append([InlineKeyboardButton("🎁 Пробная подписка", callback_data="claim_trial")])
+        else:
+            txt = (
+                "🔑 <b>Мои ключи</b>\n\n"
+                "У вас пока нет активных VPN-ключей.\n"
+                "Нажмите <b>«💳 Купить ключ»</b> для подключения единой подписки (VIP VPN):"
+            )
+        btns.append([InlineKeyboardButton("🈴 На главную", callback_data="start_back_main")] )
+        return txt, InlineKeyboardMarkup(btns)
 
     txt = f"🔑 <b>Мои ключи ({len(rows)} шт.)</b>\n\nВыберите ключ для управления и просмотра подписки:"
     kb_rows = []
@@ -8058,6 +8341,8 @@ async def handle_hwid_reset_callbacks(update, context):
 
 
 if __name__ == "__main__":
+    from migrate_db import run_migrations
+    run_migrations(DB_PATH)
     init_db()
     verify_server_lock()
     app = ApplicationBuilder().token(TOKEN).request(HTTPXRequest(connection_pool_size=16, connect_timeout=20.0, read_timeout=30.0, write_timeout=20.0, pool_timeout=10.0)).post_init(post_init).build()

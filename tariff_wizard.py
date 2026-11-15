@@ -340,8 +340,9 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
             except Exception:
                 pass
 
+        is_bot_val = 1 if (wiz.get("is_bot") == 1 or group_name == "Лицензия Бота" or "бот" in group_name.lower() or "бот" in name.lower()) else 0
         insert_cols = ["group_name", "name", "days", "price_rub", "price_stars", "is_active", "device_limit", "traffic_gb", "is_bot"]
-        vals = [group_name, name, days, price, stars, 1, devices, traffic, 0]
+        vals = [group_name, name, days, price, stars, 1, devices, traffic, is_bot_val]
 
         cur.execute(
             f"INSERT INTO tariffs ({', '.join(insert_cols)}) VALUES ({', '.join(['?']*len(vals))})",

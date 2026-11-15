@@ -50,6 +50,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
     last_online = user_info.get("last_online", "Недавно")
 
     b64_sub = base64.b64encode(sub_url.encode()).decode()
+    encoded_sub_url = urllib.parse.quote(sub_url, safe="")
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -117,6 +118,18 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
         .qr-img {{ width: 140px; height: 140px; border-radius: 12px; background: white; padding: 6px; flex-shrink: 0; }}
         .qr-text h3 {{ font-size: 16px; font-weight: 700; margin-bottom: 6px; }}
         .qr-text p {{ font-size: 13px; color: var(--text-muted); line-height: 1.5; }}
+        
+        /* Быстрый импорт в 1 клик */
+        .quick-import-card {{ background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 16px; padding: 18px 20px; margin-bottom: 16px; }}
+        .quick-import-title {{ font-size: 14px; font-weight: 700; margin-bottom: 12px; color: var(--text-main); display: flex; align-items: center; gap: 8px; }}
+        .quick-import-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }}
+        @media (max-width: 640px) {{ .quick-import-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
+        .btn-client {{ display: flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 14px; border-radius: 10px; text-decoration: none; font-weight: 600; font-size: 13px; color: #fff; transition: 0.15s; border: 1px solid rgba(255,255,255,0.08); text-align: center; }}
+        .btn-client:hover {{ transform: translateY(-1px); filter: brightness(1.1); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }}
+        .btn-happ {{ background: linear-gradient(135deg, #0284c7, #0369a1); }}
+        .btn-v2raytun {{ background: linear-gradient(135deg, #0284c7, #1e40af); }}
+        .btn-streisand {{ background: linear-gradient(135deg, #7c3aed, #6d28d9); }}
+        .btn-hiddify {{ background: linear-gradient(135deg, #0d9488, #0f766e); }}
         
         /* Вкладка 2: Приложения и переключатели ОС */
         .os-selector {{ display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }}
@@ -225,6 +238,17 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                 <button class="btn-act" onclick="navigator.clipboard.writeText('{sub_url}'); alert('Ссылка скопирована!');" title="Скопировать">📋</button>
             </div>
 
+            <!-- Быстрый импорт в 1 клик -->
+            <div class="quick-import-card">
+                <div class="quick-import-title">⚡ Подключение в 1 клик для вашего приложения:</div>
+                <div class="quick-import-grid">
+                    <a href="happ://add/{encoded_sub_url}" class="btn-client btn-happ">📱 Happ</a>
+                    <a href="v2raytun://import/{encoded_sub_url}" class="btn-client btn-v2raytun">✈️ v2rayTun</a>
+                    <a href="streisand://import/{encoded_sub_url}" class="btn-client btn-streisand">🚀 Streisand</a>
+                    <a href="hiddify://import/{encoded_sub_url}" class="btn-client btn-hiddify">🐰 Hiddify</a>
+                </div>
+            </div>
+
             <div class="qr-card">
                 <img src="{qr_b64}" class="qr-img" alt="QR Code">
                 <div class="qr-text">
@@ -253,7 +277,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/happ-proxy/happ-desktop/releases/latest" target="_blank" class="app-dl-link">Скачать EXE / MSIX ↗</a>
                         </div>
                     </div>
-                    <a href="happ://import/{sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="happ://add/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -264,7 +288,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/hiddify/hiddify-app/releases/latest" target="_blank" class="app-dl-link">Скачать установщик ↗</a>
                         </div>
                     </div>
-                    <a href="hiddify://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="hiddify://import/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -275,7 +299,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/KaringX/karing/releases/latest" target="_blank" class="app-dl-link">Скачать EXE / Store ↗</a>
                         </div>
                     </div>
-                    <a href="karing://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="karing://install-sub?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -297,7 +321,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/chen08209/FlClash/releases/latest" target="_blank" class="app-dl-link">Скачать EXE ↗</a>
                         </div>
                     </div>
-                    <a href="clash://install-config?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="clash://install-config?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -322,7 +346,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/happ-proxy/happ-android/releases/latest" target="_blank" class="app-dl-link">Скачать APK ↗</a>
                         </div>
                     </div>
-                    <a href="happ://import/{sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="happ://add/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -333,7 +357,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://play.google.com/store/apps/details?id=com.v2raytun.android" target="_blank" class="app-dl-link">Google Play ↗</a>
                         </div>
                     </div>
-                    <a href="v2raytun://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="v2raytun://import/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -344,7 +368,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" class="app-dl-link">Скачать APK ↗</a>
                         </div>
                     </div>
-                    <a href="v2rayng://install-config?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="v2rayng://install-config?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -355,7 +379,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://play.google.com/store/apps/details?id=com.karing.app" target="_blank" class="app-dl-link">Google Play ↗</a>
                         </div>
                     </div>
-                    <a href="karing://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="karing://install-sub?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -366,7 +390,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://play.google.com/store/apps/details?id=app.hiddify.com" target="_blank" class="app-dl-link">Google Play ↗</a>
                         </div>
                     </div>
-                    <a href="hiddify://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="hiddify://import/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -377,7 +401,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/SagerNet/sing-box/releases/latest" target="_blank" class="app-dl-link">GitHub APK ↗</a>
                         </div>
                     </div>
-                    <a href="sing-box://import-remote-profile?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="sing-box://import-remote-profile?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -388,7 +412,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box" target="_blank" class="app-dl-link">Google Play ↗</a>
                         </div>
                     </div>
-                    <a href="v2box://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="v2box://install-sub?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -399,7 +423,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://play.google.com/store/apps/details?id=com.incy.vpn" target="_blank" class="app-dl-link">Google Play ↗</a>
                         </div>
                     </div>
-                    <a href="incy://subscribe?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="incy://subscribe?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
             </div>
 
@@ -413,7 +437,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/happ-proxy-utility/id6504287215" target="_blank" class="app-dl-link">App Store ↗</a>
                         </div>
                     </div>
-                    <a href="happ://import/{sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="happ://add/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -424,7 +448,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/streisand/id6450534064" target="_blank" class="app-dl-link">App Store ↗</a>
                         </div>
                     </div>
-                    <a href="streisand://import/{sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="streisand://import/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -435,7 +459,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/v2raytun/id6476628186" target="_blank" class="app-dl-link">App Store ↗</a>
                         </div>
                     </div>
-                    <a href="v2raytun://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="v2raytun://import/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -446,7 +470,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/karing/id6472431552" target="_blank" class="app-dl-link">App Store ↗</a>
                         </div>
                     </div>
-                    <a href="karing://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="karing://install-sub?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -479,7 +503,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/v2box-v2ray-client/id6446814690" target="_blank" class="app-dl-link">App Store ↗</a>
                         </div>
                     </div>
-                    <a href="v2box://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="v2box://install-sub?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -490,7 +514,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/incy/id6477755359" target="_blank" class="app-dl-link">App Store ↗</a>
                         </div>
                     </div>
-                    <a href="incy://subscribe?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="incy://subscribe?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
             </div>
 
@@ -504,7 +528,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/happ-proxy-utility/id6504287215" target="_blank" class="app-dl-link">Mac App Store ↗</a>
                         </div>
                     </div>
-                    <a href="happ://import/{sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="happ://add/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -515,7 +539,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/hiddify/hiddify-app/releases/latest" target="_blank" class="app-dl-link">Скачать DMG ↗</a>
                         </div>
                     </div>
-                    <a href="hiddify://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="hiddify://import/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -526,7 +550,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/karing/id6472431552" target="_blank" class="app-dl-link">Mac App Store ↗</a>
                         </div>
                     </div>
-                    <a href="karing://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="karing://install-sub?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -537,7 +561,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://apps.apple.com/app/v2raytun/id6476628186" target="_blank" class="app-dl-link">Mac App Store ↗</a>
                         </div>
                     </div>
-                    <a href="v2raytun://install-sub?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="v2raytun://import/{encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
 
                 <div class="app-row">
@@ -559,7 +583,7 @@ def build_sub_dashboard_html(sub_url: str, sub_id: str, user_info: dict, configs
                             <a href="https://github.com/chen08209/FlClash/releases/latest" target="_blank" class="app-dl-link">Скачать DMG ↗</a>
                         </div>
                     </div>
-                    <a href="clash://install-config?url={sub_url}" class="btn-add-primary">Добавить</a>
+                    <a href="clash://install-config?url={encoded_sub_url}" class="btn-add-primary">Добавить</a>
                 </div>
             </div>
         </div>

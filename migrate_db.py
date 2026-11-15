@@ -142,7 +142,8 @@ def run_migrations(db_path: str = None) -> bool:
                 price_stars INTEGER DEFAULT 100,
                 max_devices INTEGER DEFAULT 1,
                 sort_order INTEGER DEFAULT 0,
-                is_active INTEGER DEFAULT 1
+                is_active INTEGER DEFAULT 1,
+                is_bot INTEGER DEFAULT 0
             );
         """)
 
@@ -337,6 +338,8 @@ def run_migrations(db_path: str = None) -> bool:
         # users
         add_cols_if_missing("users", {
             "trial_used": "INTEGER DEFAULT 0",
+            "trial_expires_at": "TEXT DEFAULT ''",
+            "trial_followup_stage": "INTEGER DEFAULT 0",
             "balance": "REAL DEFAULT 0",
             "referrer_id": "INTEGER DEFAULT 0",
             "is_vip": "INTEGER DEFAULT 0",
@@ -401,8 +404,41 @@ def run_migrations(db_path: str = None) -> bool:
             "group_name": "TEXT DEFAULT 'Стандарт'",
             "max_devices": "INTEGER DEFAULT 1",
             "sort_order": "INTEGER DEFAULT 0",
-            "is_active": "INTEGER DEFAULT 1"
+            "is_active": "INTEGER DEFAULT 1",
+            "is_bot": "INTEGER DEFAULT 0"
         })
+
+        # withdrawals
+        add_cols_if_missing("withdrawals", {
+            "user_id": "INTEGER DEFAULT 0",
+            "amount": "REAL DEFAULT 0",
+            "requisites": "TEXT DEFAULT ''",
+            "status": "TEXT DEFAULT 'pending'",
+            "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        })
+
+        # Авторазметка тарифов продажи/аренды бота
+        try:
+            tar_cols = [c[1] for c in cur.execute("PRAGMA table_info(tariffs)").fetchall()]
+            cur.execute("""
+                UPDATE tariffs
+                SET is_bot = 1
+                WHERE (
+                    name LIKE '%Старт 30 дней%'
+                    OR name LIKE '%Квартал (90 дней)%'
+                    OR name LIKE '%Полгода (180 дней)%'
+                    OR name LIKE '%Годовая подписка (365 дней)%'
+                    OR name LIKE '%Безлимит (LifeTime)%'
+                    OR group_name = 'Лицензия Бота'
+                    OR group_name LIKE '%Бот%'
+                ) AND (is_bot IS NULL OR is_bot = 0)
+            """)
+            if "category" in tar_cols:
+                cur.execute("UPDATE tariffs SET is_bot = 1 WHERE category = 'bot'")
+            if "tariff_type" in tar_cols:
+                cur.execute("UPDATE tariffs SET is_bot = 1 WHERE tariff_type = 'bot'")
+        except Exception as e:
+            logger.warning(f"Ошибка авторазметки тарифов бота: {e}")
 
         conn.commit()
         conn.close()

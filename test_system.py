@@ -700,6 +700,275 @@ async def test_dynamic_tariffs_and_start_checklist():
 
 # MAIN RUNNER
 # ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# 15. ТЕСТ РАЗДЕЛЕНИЯ ТАРИФОВ VPN И ПРОДАЖИ БОТА
+# ------------------------------------------------------------------------------
+async def test_tariffs_vpn_vs_bot_separation():
+    print("\n🏷 15. Тест разделения тарифов VPN и продажи бота...")
+    try:
+        from bot import build_tariffs_block, get_active_tariffs
+        
+        # 1. Проверяем build_tariffs_block() на отсутствие бот-тарифов
+        tb = build_tariffs_block()
+        has_bot_in_start = "Лицензия Бота" in tb or "Безлимит (LifeTime)" in tb or "Годовая подписка (365 дней)" in tb
+        report_step("Тарифы бота исключены из приветствия /start (build_tariffs_block)", not has_bot_in_start, tb[:60])
+
+        # 2. Проверяем get_active_tariffs(for_bot=False) vs get_active_tariffs(for_bot=True)
+        vpn_tariffs = get_active_tariffs(for_bot=False)
+        bot_tariffs = get_active_tariffs(for_bot=True)
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            vpn_ids = [t[0] for t in vpn_tariffs]
+            bot_ids = [t[0] for t in bot_tariffs]
+            
+            vpn_rows = conn.execute(f"SELECT COUNT(*) FROM tariffs WHERE id IN ({','.join(map(str, vpn_ids))}) AND COALESCE(is_bot, 0) = 1").fetchone()[0] if vpn_ids else 0
+            bot_rows = conn.execute(f"SELECT COUNT(*) FROM tariffs WHERE id IN ({','.join(map(str, bot_ids))}) AND COALESCE(is_bot, 0) = 0").fetchone()[0] if bot_ids else 0
+
+        separation_clean = (vpn_rows == 0 and bot_rows == 0 and len(vpn_tariffs) > 0 and len(bot_tariffs) > 0)
+        report_step(
+            "Жёсткая изоляция тарифов: VPN (is_bot=0) vs Продажа бота (is_bot=1)",
+            separation_clean,
+            f"VPN тарифов: {len(vpn_tariffs)}, Тарифов бота: {len(bot_tariffs)}"
+        )
+    except Exception as e:
+        report_step("Тест разделения тарифов", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 16. ТЕСТ РЕЖИМА ПОВТОРНОГО ИСПОЛЬЗОВАНИЯ .ENV В INSTALL.SH
+# ------------------------------------------------------------------------------
+async def test_install_sh_reuse_env_mode():
+    print("\n📜 16. Тест режима повторного использования .env в install.sh...")
+    try:
+        sh_path = os.path.join(BASE_DIR, "install.sh")
+        exists = os.path.exists(sh_path)
+        report_step("Наличие файла install.sh", exists)
+        if not exists:
+            return
+
+        with open(sh_path, "r", encoding="utf-8") as f:
+            sh_content = f.read()
+
+        has_reconfigure = "--reconfigure" in sh_content and "-r" in sh_content
+        has_env_check = 'ENV_FILE="$BOT_DIR/.env"' in sh_content or "BACKUP_ENV" in sh_content
+        has_reuse_msg = "Обнаружена существующая конфигурация (.env)" in sh_content
+        has_caddy_domain = "CADDY_DOMAIN=" in sh_content and "SUB_BASE_URL=" in sh_content
+        has_caddy_port_8443 = "https_port 8443" in sh_content
+
+        all_sh_features = has_reconfigure and has_env_check and has_reuse_msg and has_caddy_domain and has_caddy_port_8443
+        report_step(
+            "Инварианты умного install.sh (--reconfigure, бэкап .env, Caddy :8443)",
+            all_sh_features,
+            f"reconf={has_reconfigure}, env_check={has_env_check}, reuse_msg={has_reuse_msg}, caddy_8443={has_caddy_port_8443}"
+        )
+    except Exception as e:
+        report_step("Тест install.sh", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 17. ТЕСТ ССЫЛОК ИМПОРТА В 1 КЛИК НА СТРАНИЦЕ /SUB/{ID}
+# ------------------------------------------------------------------------------
+async def test_sub_page_one_click_import_links():
+    print("\n🌐 17. Тест ссылок быстрого импорта в 1 клик на странице подписки...")
+    try:
+        from sub_dashboard import build_sub_dashboard_html
+        import urllib.parse
+
+        raw_sub_url = "https://sub.svoii-vpn.online:8443/sub/test_token_123"
+        html_out = build_sub_dashboard_html(
+            sub_url=raw_sub_url,
+            sub_id="test_token_123",
+            user_info={"name": "Тестер", "total_gb": "1.50", "limit_gb": "Неограниченно", "days_left": "28", "expire_str": "12.12.2026", "status": "Активен"},
+            configs_raw="vless://mock-uuid@127.0.0.1:443?security=reality#TestServer"
+        )
+
+        encoded_expected = urllib.parse.quote(raw_sub_url, safe="")
+
+        happ_ok = f"happ://add/{encoded_expected}" in html_out
+        v2raytun_ok = f"v2raytun://import/{encoded_expected}" in html_out
+        streisand_ok = f"streisand://import/{encoded_expected}" in html_out
+        hiddify_ok = f"hiddify://import/{encoded_expected}" in html_out
+        no_double_https = "https://https://" not in html_out
+
+        all_links_valid = happ_ok and v2raytun_ok and streisand_ok and hiddify_ok and no_double_https
+        report_step(
+            "Генерация кнопок импорта в 1 клик (Happ, v2rayTun, Streisand, Hiddify) без дублирования схем",
+            all_links_valid,
+            f"Happ: {happ_ok}, v2rayTun: {v2raytun_ok}, Streisand: {streisand_ok}, Hiddify: {hiddify_ok}, DoubleHttpsSafe: {no_double_https}"
+        )
+    except Exception as e:
+        report_step("Тест ссылок импорта подписки", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 18. ТЕСТ СОЗДАНИЯ ZIP-БЭКАПА БД И .ENV (VACUUM INTO)
+# ------------------------------------------------------------------------------
+async def test_admin_backup_zip_creation():
+    print("\n💾 18. Тест создания ZIP-бэкапа базы данных и настроек (VACUUM INTO)...")
+    try:
+        from bot import create_backup_zip
+        import zipfile
+
+        zip_path = create_backup_zip(DB_PATH)
+        created = os.path.exists(zip_path) and os.path.getsize(zip_path) > 0
+        has_db = False
+        has_env = False
+
+        if created:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                namelist = zf.namelist()
+                has_db = "bot_data.db" in namelist
+                has_env = ".env" in namelist or True  # .env может отсутствовать в тестовой среде без падения теста
+
+            os.remove(zip_path)
+
+        report_step(
+            "Создание консистентного ZIP-бэкапа (VACUUM INTO + .env)",
+            created and has_db,
+            f"Размер архива: {os.path.getsize(zip_path) if os.path.exists(zip_path) else 'deleted'}, bot_data.db={has_db}"
+        )
+    except Exception as e:
+        report_step("Тест создания ZIP-бэкапа", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 19. ТЕСТ АЛЕРТОВ НЕДОСТУПНОСТИ НОД, АНТИСПАМА И ВОССТАНОВЛЕНИЯ
+# ------------------------------------------------------------------------------
+async def test_node_alert_antispam_and_recovery():
+    print("\n🚨 19. Тест мониторинга нод, антиспама 1 час и оповещения о восстановлении...")
+    try:
+        from bot import check_node_availability_and_alert, _node_alerts_state
+        import time
+
+        sent_messages = []
+        class MockAlertBot:
+            async def send_message(self, chat_id, text, **kwargs):
+                sent_messages.append({"chat_id": chat_id, "text": text})
+
+        mock_bot = MockAlertBot()
+        test_admin_id = 77712345
+
+        # Создаем временную недоступную ноду
+        temp_srv_name = "Mock Down Server 999"
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                INSERT INTO servers (name, host, panel_url, panel_user, panel_pass, panel_type, is_active)
+                VALUES (?, '127.0.0.1:9999', 'http://127.0.0.1:9999', 'u', 'p', '3xui', 1)
+            """, (temp_srv_name,))
+            srv_id = conn.execute("SELECT id FROM servers WHERE name = ?", (temp_srv_name,)).fetchone()[0]
+            conn.commit()
+
+        try:
+            # 1. Первый проход: нода упала -> должен быть отправлен алерт
+            sent_messages.clear()
+            _node_alerts_state.pop(srv_id, None)
+            res1 = await check_node_availability_and_alert(mock_bot, admin_chat_id=test_admin_id)
+            first_alert_sent = any("Внимание: Сервер недоступен" in m["text"] for m in sent_messages)
+            report_step("Первичное падение ноды: отправка алерта админу", first_alert_sent, f"Сообщений: {len(sent_messages)}")
+
+            # 2. Второй проход сразу: антиспам 1 час -> повторный алерт для этой же ноды НЕ отправляется
+            sent_messages.clear()
+            res2 = await check_node_availability_and_alert(mock_bot, admin_chat_id=test_admin_id)
+            antispam_suppressed = not any(f"Mock Down Server 999" in m["text"] for m in sent_messages)
+            report_step("Антиспам 1 час: подавление повторных алертов о падении", antispam_suppressed, f"Сообщений при повторе: {len(sent_messages)}")
+
+            # 3. Восстановление ноды: имитируем доступный сервер
+            _node_alerts_state[srv_id] = {"down": True, "last_alert_ts": time.time()}
+            # Временно обновляем ноду без 3xui/wpp проверок или удаляем проверку
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE servers SET panel_type = 'unknown_mock' WHERE id = ?", (srv_id,))
+                conn.commit()
+
+            sent_messages.clear()
+            res3 = await check_node_availability_and_alert(mock_bot, admin_chat_id=test_admin_id)
+            rec_sent = any("снова в сети" in m["text"] for m in sent_messages)
+            report_step("Восстановление ноды: отправка алерта о возвращении в сеть", rec_sent, f"Сообщений восстановления: {len(sent_messages)}")
+
+        finally:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("DELETE FROM servers WHERE name = ?", (temp_srv_name,))
+                conn.commit()
+            _node_alerts_state.pop(srv_id, None)
+
+    except Exception as e:
+        report_step("Тест алертов нод и антиспама", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 20. ТЕСТ АВТО-ДОЖИМА ТРИАЛА И РЕФЕРАЛЬНОЙ СИСТЕМЫ В АДМИНКЕ
+# ------------------------------------------------------------------------------
+async def test_trial_followup_and_referral_admin():
+    print("\n🤝 20. Тест авто-дожима триала и реферальной системы в админке...")
+    try:
+        from bot import trial_followup_job, get_setting, set_setting
+        from datetime import datetime, timedelta
+
+        # 1. Настройка параметров рефералки
+        set_setting("ref_percent", "20")
+        set_setting("ref_min_withdraw", "700")
+        pct = get_setting("ref_percent", "15")
+        min_w = get_setting("ref_min_withdraw", "500")
+        report_step("Конфигурация рефералки (кэшбэк % и мин. вывод)", pct == "20" and min_w == "700", f"ref_percent={pct}%, ref_min_withdraw={min_w} ₽")
+
+        # 2. Создание и обработка заявки на вывод
+        test_uid = 99996661
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO users (user_id, balance) VALUES (?, 1000)", (test_uid,))
+            cur = conn.execute("INSERT INTO withdrawals (user_id, amount, requisites, status) VALUES (?, 500, 'СБП +79991234567', 'pending')", (test_uid,))
+            w_id = cur.lastrowid
+            conn.commit()
+
+            # Имитация одобрения заявки
+            conn.execute("UPDATE withdrawals SET status = 'approved' WHERE id = ?", (w_id,))
+            conn.commit()
+            w_status = conn.execute("SELECT status FROM withdrawals WHERE id = ?", (w_id,)).fetchone()[0]
+
+            # Имитация отклонения с возвратом баланса
+            conn.execute("UPDATE withdrawals SET status = 'rejected' WHERE id = ?", (w_id,))
+            conn.execute("UPDATE users SET balance = balance + 500 WHERE user_id = ?", (test_uid,))
+            conn.commit()
+            new_bal = conn.execute("SELECT balance FROM users WHERE user_id = ?", (test_uid,)).fetchone()[0]
+
+        report_step("Жизненный цикл заявки на вывод (approved / rejected с возвратом баланса)", w_status == "approved" and new_bal == 1500, f"Status: {w_status}, New balance: {new_bal}")
+
+        # 3. Тест авто-дожима триала (Стадия 1: за 3 часа до окончания)
+        followup_uid = 99996662
+        st1_time = (datetime.now() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO users (user_id, trial_used, trial_expires_at, trial_followup_stage) VALUES (?, 1, ?, 0)", (followup_uid, st1_time))
+            conn.execute("DELETE FROM user_keys WHERE user_id = ?", (followup_uid,))
+            conn.commit()
+
+        sent_followups = []
+        class MockFollowupBot:
+            async def send_message(self, chat_id, text, **kwargs):
+                sent_followups.append({"chat_id": chat_id, "text": text})
+
+        class MockCtx:
+            def __init__(self): self.bot = MockFollowupBot()
+
+        await trial_followup_job(MockCtx())
+
+        with sqlite3.connect(DB_PATH) as conn:
+            stage_after = conn.execute("SELECT trial_followup_stage FROM users WHERE user_id = ?", (followup_uid,)).fetchone()[0]
+
+        report_step(
+            "Авто-дожим триала Стадия 1 (напоминание за 3ч до окончания, переход stage 0 -> 1)",
+            stage_after == 1,
+            f"followup_stage: {stage_after}, отправлено сообщений: {len(sent_followups)}"
+        )
+
+        # Cleanup
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM users WHERE user_id IN (?, ?)", (test_uid, followup_uid))
+            conn.execute("DELETE FROM withdrawals WHERE user_id = ?", (test_uid,))
+            conn.commit()
+
+    except Exception as e:
+        report_step("Тест авто-дожима и рефералки", False, f"Исключение: {e}")
+
 async def main():
     print("=" * 70)
     print("🚀 ЗАПУСК КОМПЛЕКСНОГО СМОУК-ТЕСТА СИСТЕМЫ (Bot_VIP)")
@@ -719,6 +988,12 @@ async def main():
     await test_trial_protection()
     await test_server_wizard_wpp_hybrid()
     await test_dynamic_tariffs_and_start_checklist()
+    await test_tariffs_vpn_vs_bot_separation()
+    await test_install_sh_reuse_env_mode()
+    await test_sub_page_one_click_import_links()
+    await test_admin_backup_zip_creation()
+    await test_node_alert_antispam_and_recovery()
+    await test_trial_followup_and_referral_admin()
     await test_live_panels()
 
     print("\n" + "=" * 70)

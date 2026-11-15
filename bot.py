@@ -293,6 +293,8 @@ import base64
 import socket
 import secrets
 import hashlib
+import zipfile
+import time as _pytime
 # --- SQLite AutoClose Context Fix ---
 import sqlite3
 _orig_sqlite_connect = sqlite3.connect
@@ -1871,7 +1873,7 @@ def render_bot_settings_main_screen() -> tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton("🔄 Обновления", callback_data="admin_bset_updates")],
         [InlineKeyboardButton("🌐 Веб и Mini App", callback_data="admin_bset_webapp")],
         [InlineKeyboardButton("📢 Новостной канал (для триала)", callback_data="admin_bset_news_chan")],
-        [InlineKeyboardButton("📦 Создать бэкап", callback_data="admin_bset_backup")],
+        [InlineKeyboardButton("💾 Скачать бэкап сейчас", callback_data="admin_backup_now")],
         [InlineKeyboardButton("📱 Ограничение устройств", callback_data="admin_bset_devices")],
         [InlineKeyboardButton("✏️ Изменить тексты", callback_data="admin_bset_texts")],
         [InlineKeyboardButton("📥 Скачать логи", callback_data="admin_bset_logs")],
@@ -1889,6 +1891,42 @@ def get_current_git_commit() -> str:
         return res.decode("utf-8").strip()
     except Exception:
         return "main (stable)"
+
+def create_backup_zip(db_path: str = None) -> str:
+    """Создает консистентный снимок SQLite через VACUUM INTO и упаковывает в ZIP вместе с .env"""
+    target_db = db_path or DB_PATH
+    backup_root = os.path.join(BASE_DIR, "backup")
+    os.makedirs(backup_root, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    zip_filename = f"backup_Bot_VIP2_{ts}.zip"
+    zip_path = os.path.join(backup_root, zip_filename)
+    tmp_snap_db = os.path.join(backup_root, f"tmp_snap_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.db")
+
+    try:
+        if os.path.exists(target_db):
+            clean_db_path = repr(tmp_snap_db.replace('\\', '/'))
+            with sqlite3.connect(target_db, timeout=30.0) as conn:
+                conn.execute(f"VACUUM INTO {clean_db_path}")
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            if os.path.exists(tmp_snap_db):
+                zf.write(tmp_snap_db, arcname="bot_data.db")
+            elif os.path.exists(target_db):
+                zf.write(target_db, arcname="bot_data.db")
+
+            env_candidates = [os.path.join(BASE_DIR, ".env"), "/opt/Bot_VIP/.env", "/root/env.bak"]
+            for ec in env_candidates:
+                if os.path.exists(ec):
+                    zf.write(ec, arcname=".env")
+                    break
+
+        return zip_path
+    finally:
+        if os.path.exists(tmp_snap_db):
+            try:
+                os.remove(tmp_snap_db)
+            except Exception:
+                pass
 
 def create_manual_snapshot_backup() -> str:
     backup_root = os.path.join(BASE_DIR, "backup")
@@ -2432,8 +2470,8 @@ def get_active_tariffs(for_bot: bool = False):
             cols = [c[1] for c in conn.execute("PRAGMA table_info(tariffs)").fetchall()]
             stars_col = "price_stars" if "price_stars" in cols else "0"
             act_cond = "AND is_active = 1" if "is_active" in cols else ""
-            grp_val = "'Лицензия Бота'" if for_bot else "'VPN'"
-            sql = f"SELECT id, {grp_val}, name, days, price_rub, {stars_col} FROM tariffs WHERE (is_bot = {target} OR (is_bot IS NULL AND {target} = 0)) {act_cond} ORDER BY price_rub ASC"
+            grp_col = "group_name" if "group_name" in cols else ("'Лицензия Бота'" if for_bot else "'VPN'")
+            sql = f"SELECT id, {grp_col}, name, days, price_rub, {stars_col} FROM tariffs WHERE COALESCE(is_bot, 0) = {target} {act_cond} ORDER BY price_rub ASC"
             return conn.execute(sql).fetchall()
     except Exception as e:
         import logging
@@ -3017,18 +3055,26 @@ async def post_init(application):
 
 async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
     if ADMIN_ID and os.path.exists(DB_PATH) and is_notif_enabled("notify_backup"):
+        zip_p = ""
         try:
-            snap_file = create_manual_snapshot_backup()
-            with open(snap_file, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=ADMIN_ID,
-                    document=f,
-                    filename=f"auto_backup_{datetime.now().strftime('%Y%m%d')}.db",
-                    caption="⏰ <b>Ежедневный автоматический бэкап базы данных</b>",
-                    parse_mode="HTML"
-                )
+            zip_p = create_backup_zip()
+            if os.path.exists(zip_p):
+                with open(zip_p, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=ADMIN_ID,
+                        document=f,
+                        filename=os.path.basename(zip_p),
+                        caption=f"⏰ <b>Ежедневный автоматический бэкап Bot_VIP2</b>\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\nВ архиве: снимок базы SQLite и .env",
+                        parse_mode="HTML"
+                    )
         except Exception as e:
             logger.error(f"Ошибка авто-бэкапа: {e}")
+        finally:
+            if zip_p and os.path.exists(zip_p):
+                try:
+                    os.remove(zip_p)
+                except Exception:
+                    pass
 
 async def expire_vips_job(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3095,6 +3141,111 @@ async def expire_vips_job(context: ContextTypes.DEFAULT_TYPE):
             mark_user_blocked_bot(u_id, 1)
         except Exception:
             pass
+
+
+async def trial_followup_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Фоновый авто-дожим пользователей после триального периода:
+    - Стадия 1: за 3-4 часа до окончания пробного периода (напоминание со скидкой)
+    - Стадия 2: через 24 часа после окончания триала (персональное предложение вернуться)
+    Только для пользователей без активных платных ключей!
+    """
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            # Стадия 1: пользователи на стадии 0 с установленной датой окончания
+            rows_st0 = conn.execute("""
+                SELECT user_id, trial_expires_at FROM users
+                WHERE trial_used = 1 AND trial_followup_stage = 0
+                  AND trial_expires_at != '' AND trial_expires_at IS NOT NULL
+            """).fetchall()
+
+            for r in rows_st0:
+                uid = r["user_id"]
+                exp_s = r["trial_expires_at"]
+                try:
+                    exp_clean = exp_s.split(".")[0]
+                    dt_fmt = "%Y-%m-%d %H:%M:%S" if " " in exp_clean else "%Y-%m-%d"
+                    exp_dt = datetime.strptime(exp_clean, dt_fmt)
+                    delta_sec = (exp_dt - now).total_seconds()
+                    # За 3-4 часа до окончания (от 0 до 4*3600 сек)
+                    if 0 < delta_sec <= 4 * 3600:
+                        # Проверяем наличие активных платных ключей
+                        paid_cnt = conn.execute("""
+                            SELECT COUNT(*) FROM user_keys
+                            WHERE user_id = ? AND is_active = 1 AND expires_at > ?
+                              AND key_name NOT LIKE '%Пробный%'
+                        """, (uid, now_str)).fetchone()[0]
+
+                        if paid_cnt == 0:
+                            msg_text = (
+                                "⏳ <b>Ваш пробный период VPN скоро завершится!</b>\n\n"
+                                "Через несколько часов действие бесплатного доступа закончится.\n"
+                                "Чтобы не остаться без быстрого и безопасного интернета, "
+                                "продлите подписку прямо сейчас со скидкой! 🛡"
+                            )
+                            kb = InlineKeyboardMarkup([
+                                [InlineKeyboardButton("💳 Продлить со скидкой", callback_data="user_tariffs")],
+                                [InlineKeyboardButton("🔑 Мои ключи", callback_data="my_keys")]
+                            ])
+                            try:
+                                await context.bot.send_message(chat_id=uid, text=msg_text, parse_mode="HTML", reply_markup=kb)
+                            except Exception as _se:
+                                logger.warning(f"trial_followup stage 1 send error for {uid}: {_se}")
+
+                        conn.execute("UPDATE users SET trial_followup_stage = 1 WHERE user_id = ?", (uid,))
+                        conn.commit()
+                except Exception as _pe:
+                    continue
+
+            # Стадия 2: пользователи на стадии 1, у которых прошло >= 24ч после окончания
+            rows_st1 = conn.execute("""
+                SELECT user_id, trial_expires_at FROM users
+                WHERE trial_used = 1 AND trial_followup_stage = 1
+                  AND trial_expires_at != '' AND trial_expires_at IS NOT NULL
+            """).fetchall()
+
+            for r in rows_st1:
+                uid = r["user_id"]
+                exp_s = r["trial_expires_at"]
+                try:
+                    exp_clean = exp_s.split(".")[0]
+                    dt_fmt = "%Y-%m-%d %H:%M:%S" if " " in exp_clean else "%Y-%m-%d"
+                    exp_dt = datetime.strptime(exp_clean, dt_fmt)
+                    since_expired = (now - exp_dt).total_seconds()
+                    # Через 24 часа после окончания
+                    if since_expired >= 24 * 3600:
+                        paid_cnt = conn.execute("""
+                            SELECT COUNT(*) FROM user_keys
+                            WHERE user_id = ? AND is_active = 1 AND expires_at > ?
+                              AND key_name NOT LIKE '%Пробный%'
+                        """, (uid, now_str)).fetchone()[0]
+
+                        if paid_cnt == 0:
+                            msg_text = (
+                                "🎁 <b>Специальное персональное предложение!</b>\n\n"
+                                "Мы заметили, что действие вашего пробного доступа закончилось.\n"
+                                "Мы сохранили ваши настройки и выделенный сервер — вернитесь к любимым ресурсам "
+                                "в 1 клик на максимальной скорости без ограничений! 🚀"
+                            )
+                            kb = InlineKeyboardMarkup([
+                                [InlineKeyboardButton("🚀 Восстановить доступ в 1 клик", callback_data="user_tariffs")],
+                                [InlineKeyboardButton("🈴 В главное меню", callback_data="start_back_main")]
+                            ])
+                            try:
+                                await context.bot.send_message(chat_id=uid, text=msg_text, parse_mode="HTML", reply_markup=kb)
+                            except Exception as _se2:
+                                logger.warning(f"trial_followup stage 2 send error for {uid}: {_se2}")
+
+                        conn.execute("UPDATE users SET trial_followup_stage = 2 WHERE user_id = ?", (uid,))
+                        conn.commit()
+                except Exception as _pe2:
+                    continue
+    except Exception as _tfe:
+        logger.error(f"trial_followup_job error: {_tfe}")
 
 async def sync_traffic_job(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3234,11 +3385,107 @@ async def sync_traffic_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+
+_node_alerts_state = {}
+
+async def check_node_availability_and_alert(bot=None, admin_chat_id: int = None) -> list[dict]:
+    """Мониторинг доступности нод 3X-UI и WPP с подавлением спама (1 час) и алертом о восстановлении"""
+    global _node_alerts_state
+    now_ts = _pytime.time()
+    results = []
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            servers = [dict(r) for r in conn.execute("SELECT * FROM servers WHERE is_active = 1").fetchall()]
+    except Exception as e:
+        logger.warning(f"check_node_availability error reading servers: {e}")
+        return results
+
+    admin_target = admin_chat_id or int(os.getenv("ADMIN_ID", "0") or ADMIN_ID or 0)
+
+    for srv in servers:
+        srv_id = srv["id"]
+        srv_name = srv["name"]
+        srv_ip = srv.get("host", "")
+        panel_type = str(srv.get("panel_type") or "3xui").lower()
+
+        srv_down = False
+        err_details = []
+
+        # 1. Проверка 3X-UI
+        if panel_type in ("3xui", "both"):
+            try:
+                p_url = srv.get("panel_url") or f"http://{srv_ip}:2053"
+                adapter = XUIAdapter(p_url, srv.get("panel_user", ""), srv.get("panel_pass", ""), timeout=5.0)
+                inbs = await adapter.get_inbounds()
+                if not inbs:
+                    srv_down = True
+                    err_details.append("3X-UI Auth / Connection Error")
+            except Exception as xe:
+                srv_down = True
+                err_details.append(f"3X-UI Error: {xe}")
+
+        # 2. Проверка WPP
+        if panel_type in ("wpp", "both"):
+            try:
+                from wpp_client import WPPClient
+                w_client = WPPClient(server=srv, timeout=5.0)
+                profiles = await w_client.list_profiles_async()
+            except Exception as we:
+                srv_down = True
+                err_details.append(f"WPP Error: {we}")
+
+        prev_state = _node_alerts_state.get(srv_id, {"down": False, "last_alert_ts": 0})
+        is_previously_down = prev_state.get("down", False)
+        last_alert_ts = prev_state.get("last_alert_ts", 0)
+
+        if srv_down:
+            results.append({"server_id": srv_id, "name": srv_name, "status": "down", "error": "; ".join(err_details)})
+            # Антиспам 1 час (3600 секунд)
+            if (not is_previously_down) or (now_ts - last_alert_ts >= 3600):
+                _node_alerts_state[srv_id] = {"down": True, "last_alert_ts": now_ts}
+                if bot and admin_target:
+                    err_txt = html.escape("; ".join(err_details))
+                    alert_msg = (
+                        f"🚨 <b>Внимание: Сервер недоступен!</b>\n\n"
+                        f"🖥 Сервер: <b>{html.escape(srv_name)}</b> (<code>{srv_ip}</code>)\n"
+                        f"⚙️ Тип панели: <code>{panel_type}</code>\n"
+                        f"❌ Ошибка: <code>{err_txt}</code>\n\n"
+                        f"<i>Повторное уведомление при сохранении проблемы — через 1 час.</i>"
+                    )
+                    try:
+                        await bot.send_message(chat_id=admin_target, text=alert_msg, parse_mode="HTML")
+                    except Exception as _send_err:
+                        logger.warning(f"Failed to send node down alert: {_send_err}")
+        else:
+            results.append({"server_id": srv_id, "name": srv_name, "status": "up"})
+            if is_previously_down:
+                _node_alerts_state[srv_id] = {"down": False, "last_alert_ts": 0}
+                if bot and admin_target:
+                    rec_msg = (
+                        f"✅ <b>Сервер снова в сети!</b>\n\n"
+                        f"🖥 Сервер: <b>{html.escape(srv_name)}</b> (<code>{srv_ip}</code>)\n"
+                        f"Панель управления успешно ответила на запросы проверки связи."
+                    )
+                    try:
+                        await bot.send_message(chat_id=admin_target, text=rec_msg, parse_mode="HTML")
+                    except Exception as _send_err:
+                        logger.warning(f"Failed to send node recovery alert: {_send_err}")
+
+    return results
+
 async def sync_server_nodes_job(context: ContextTypes.DEFAULT_TYPE):
     """
     6-я фоновая задача: периодическая синхронизация активных ключей с актуальными серверами
-    (интервал 10 минут). Провижинит ключи на новые ноды и обновляет ссылки Reality/TLS.
+    и мониторинг доступности нод с оповещениями администратора.
     """
+    try:
+        # Мониторинг доступности серверов и алерты
+        await check_node_availability_and_alert(getattr(context, "bot", None))
+    except Exception as _mon_e:
+        logger.error(f"[sync_server_nodes_job] Ошибка мониторинга нод: {_mon_e}")
+
     try:
         from panel_manager import sync_active_keys_with_servers
         res = await sync_active_keys_with_servers(DB_PATH)
@@ -4009,11 +4256,10 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             t_days = int(get_setting("trial_days", "3") or 3)
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (user.id,))
-                conn.commit()
-
             k_id, until, sub_url, _ = await create_or_extend_user_key(user.id, days=t_days, create_new=True)
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE users SET trial_used = 1, trial_expires_at = ?, trial_followup_stage = 0 WHERE user_id = ?", (str(until), user.id))
+                conn.commit()
             try:
                 with sqlite3.connect(DB_PATH) as conn:
                     conn.execute("UPDATE user_keys SET key_name = ? WHERE id = ?", (f"🎁 Пробный ключ #{k_id}", k_id))
@@ -4616,16 +4862,28 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"✅ Кнопка Mini App отключена.\n\n{text_out}", parse_mode="HTML", reply_markup=kb_out)
         return
 
-    if data == "admin_bset_backup":
-        snap_path = create_manual_snapshot_backup()
-        if os.path.exists(snap_path):
-            with open(snap_path, "rb") as f:
-                await query.message.reply_document(
-                    document=f,
-                    filename=f"backup_Bot_VIP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
-                    caption="📦 <b>Резервная копия базы данных успешно создана!</b>\nСнимок также сохранен в каталоге <code>backup/</code> для быстрого отката.",
-                    parse_mode="HTML"
-                )
+    if data in ("admin_backup_now", "admin_bset_backup", "admin_backup"):
+        await query.answer("💾 Создаю резервную копию базы и настроек...")
+        zip_p = ""
+        try:
+            zip_p = create_backup_zip()
+            if os.path.exists(zip_p):
+                with open(zip_p, "rb") as f:
+                    await query.message.reply_document(
+                        document=f,
+                        filename=os.path.basename(zip_p),
+                        caption=f"💾 <b>Полный резервный бэкап Bot_VIP2</b>\n📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\nВ архиве: консистентный снимок SQLite (VACUUM INTO) и файл конфигурации .env",
+                        parse_mode="HTML"
+                    )
+        except Exception as _b_err:
+            logger.error(f"Backup zip error: {_b_err}")
+            await query.message.reply_text(f"❌ Ошибка создания бэкапа: {_b_err}")
+        finally:
+            if zip_p and os.path.exists(zip_p):
+                try:
+                    os.remove(zip_p)
+                except Exception:
+                    pass
         text_out, kb_out = render_bot_settings_main_screen()
         await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
         return
@@ -4805,26 +5063,159 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st_icon = "🟢 Включена" if ref_on else "🔴 Выключена"
         b_inv = get_setting("ref_bonus_days", "7")
         b_new = get_setting("ref_NewUser_days", "3")
+        ref_pct = get_setting("ref_percent", "15")
+        ref_min = get_setting("ref_min_withdraw", "500")
+
+        pending_withd = 0
+        total_refs = 0
         with sqlite3.connect(DB_PATH) as conn:
-            total_refs = conn.execute("SELECT COALESCE(SUM(referrals_count), 0) FROM users").fetchone()[0]
+            try:
+                total_refs = conn.execute("SELECT COALESCE(SUM(referrals_count), 0) FROM users").fetchone()[0]
+            except Exception:
+                pass
+            try:
+                pending_withd = conn.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'").fetchone()[0]
+            except Exception:
+                pass
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Включить / Выключить реф. систему", callback_data="admin_mkt_ref_toggle")],
-            [InlineKeyboardButton("🎁 Изменить бонусные дни (Пригласившему | Другу)", callback_data="admin_mkt_ref_edit")],
+            [
+                InlineKeyboardButton(f"💰 Кэшбэк ({ref_pct}%)", callback_data="admin_ref_pct_edit"),
+                InlineKeyboardButton(f"💳 Мин. вывод ({ref_min} ₽)", callback_data="admin_ref_min_edit")
+            ],
+            [InlineKeyboardButton(f"💸 Заявки на вывод ({pending_withd})", callback_data="admin_withd_list")],
+            [InlineKeyboardButton("🎁 Бонусные дни (Пригласившему | Другу)", callback_data="admin_mkt_ref_edit")],
             [
                 InlineKeyboardButton("⬅️ Назад", callback_data="admin_marketing_menu"),
                 InlineKeyboardButton("🈴 На главную", callback_data="admin_back_main")
             ]
         ])
         await query.edit_message_text(
-            f"🔗 <b>Реферальная система</b>\n\n"
+            f"🤝 <b>Реферальная система и выплаты</b>\n\n"
             f"📡 Статус: <b>{st_icon}</b>\n"
-            f"🎁 Бонус пригласившему: <b>+{html.escape(b_inv)} дн. подписки</b>\n"
-            f"🎉 Бонус приглашенному другу: <b>+{html.escape(b_new)} дн. подписки</b>\n"
-            f"👥 Всего приглашено по реф. ссылкам: <b>{total_refs} чел.</b>",
+            f"💰 Процент кэшбэка от оплат: <b>{ref_pct}%</b>\n"
+            f"💳 Минимальная сумма вывода: <b>{ref_min} ₽</b>\n"
+            f"🎁 Бонус днями: <b>+{html.escape(b_inv)} дн. / +{html.escape(b_new)} дн.</b>\n"
+            f"👥 Всего приглашено друзей: <b>{total_refs} чел.</b>\n"
+            f"⏳ Ожидают выплаты: <b>{pending_withd} заявок</b>",
             parse_mode="HTML",
             reply_markup=kb
         )
+        return
+
+    if data == "admin_ref_pct_edit":
+        context.user_data["mode"] = "edit_ref_pct"
+        await query.edit_message_text(
+            "💰 <b>Настройка процента кэшбэка</b>\n\n"
+            "Отправьте целое число от 1 до 100 — процент от покупок рефералов, "
+            "который начисляется на баланс пригласившего пользователя (например: <code>15</code>):",
+            parse_mode="HTML"
+        )
+        return
+
+    if data == "admin_ref_min_edit":
+        context.user_data["mode"] = "edit_ref_min"
+        await query.edit_message_text(
+            "💳 <b>Настройка минимальной суммы вывода</b>\n\n"
+            "Отправьте сумму в рублях, начиная с которой пользователь может запросить вывод "
+            "(например: <code>500</code>):",
+            parse_mode="HTML"
+        )
+        return
+
+    if data == "admin_withd_list":
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT id, user_id, amount, requisites, created_at FROM withdrawals
+                WHERE status = 'pending' ORDER BY id ASC LIMIT 10
+            """).fetchall()
+
+        if not rows:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ К реф. системе", callback_data="admin_mkt_referrals")]
+            ])
+            await query.edit_message_text(
+                "📭 <b>Активных заявок на вывод средств нет.</b>\n\nВсе заявки обработаны!",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+            return
+
+        for r in rows:
+            w_id = r["id"]
+            w_uid = r["user_id"]
+            w_amt = r["amount"]
+            w_req = r["requisites"] or "Не указаны"
+            w_dt = r["created_at"] or ""
+            kb_item = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Выплачено", callback_data=f"admin_withd_app_{w_id}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_withd_rej_{w_id}")
+                ]
+            ])
+            await query.message.reply_text(
+                f"💸 <b>Заявка на вывод #{w_id}</b>\n\n"
+                f"👤 Пользователь: <code>{w_uid}</code>\n"
+                f"💰 Сумма: <b>{w_amt} ₽</b>\n"
+                f"💳 Реквизиты: <code>{html.escape(w_req)}</code>\n"
+                f"📅 Дата: {w_dt}",
+                parse_mode="HTML",
+                reply_markup=kb_item
+            )
+
+        kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К реф. системе", callback_data="admin_mkt_referrals")]])
+        await query.edit_message_text("👆 Список активных заявок выше:", reply_markup=kb_back)
+        return
+
+    if data.startswith("admin_withd_app_"):
+        w_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            w_row = conn.execute("SELECT user_id, amount FROM withdrawals WHERE id = ?", (w_id,)).fetchone()
+            if w_row:
+                conn.execute("UPDATE withdrawals SET status = 'approved' WHERE id = ?", (w_id,))
+                conn.commit()
+                try:
+                    await context.bot.send_message(
+                        chat_id=w_row["user_id"],
+                        text=f"✅ <b>Ваша заявка на вывод #{w_id} на сумму {w_row['amount']} ₽ одобрена и выплачена!</b>\nБлагодарим за сотрудничество!",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+        await query.answer(f"Заявка #{w_id} отмечена как выплаченная!", show_alert=True)
+        try:
+            await query.message.edit_text(f"✅ Заявка #{w_id} успешно одобрена и выплачена.")
+        except Exception:
+            pass
+        return
+
+    if data.startswith("admin_withd_rej_"):
+        w_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            w_row = conn.execute("SELECT user_id, amount FROM withdrawals WHERE id = ?", (w_id,)).fetchone()
+            if w_row:
+                u_id = w_row["user_id"]
+                amt = w_row["amount"]
+                conn.execute("UPDATE withdrawals SET status = 'rejected' WHERE id = ?", (w_id,))
+                conn.execute("UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE user_id = ?", (amt, u_id))
+                conn.commit()
+                try:
+                    await context.bot.send_message(
+                        chat_id=u_id,
+                        text=f"❌ <b>Ваша заявка на вывод #{w_id} на сумму {amt} ₽ отклонена.</b>\nСредства возвращены на ваш баланс.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+        await query.answer(f"Заявка #{w_id} отклонена, баланс возвращен!", show_alert=True)
+        try:
+            await query.message.edit_text(f"❌ Заявка #{w_id} отклонена. Средства возвращены на баланс пользователя.")
+        except Exception:
+            pass
         return
 
     if data == "admin_mkt_ref_toggle":
@@ -5838,6 +6229,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await handle_payment_admin_text(update.message, update.effective_user, context, set_setting, get_setting, ADMIN_ID):
         return
     user = update.effective_user
+    mode = context.user_data.get("mode")
+    if mode == "edit_ref_pct":
+        try:
+            pct_val = int(update.message.text.strip())
+            if 1 <= pct_val <= 100:
+                set_setting("ref_percent", str(pct_val))
+                context.user_data.pop("mode", None)
+                await update.message.reply_text(f"✅ Процент кэшбэка успешно изменен на <b>{pct_val}%</b>!", parse_mode="HTML")
+            else:
+                await update.message.reply_text("❌ Введите целое число от 1 до 100.")
+        except ValueError:
+            await update.message.reply_text("❌ Введите корректное число от 1 до 100.")
+        return
+
+    if mode == "edit_ref_min":
+        try:
+            min_val = int(update.message.text.strip())
+            if min_val > 0:
+                set_setting("ref_min_withdraw", str(min_val))
+                context.user_data.pop("mode", None)
+                await update.message.reply_text(f"✅ Минимальная сумма вывода установлена на <b>{min_val} ₽</b>!", parse_mode="HTML")
+            else:
+                await update.message.reply_text("❌ Сумма должна быть больше 0.")
+        except ValueError:
+            await update.message.reply_text("❌ Введите корректное число.")
+        return
+
     msg = update.message
     text = msg.text or ""
 
@@ -6519,10 +6937,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             t_days = int(get_setting("trial_days", "3") or 3)
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (user.id,))
-                conn.commit()
             k_id, until, sub_url, _ = await create_or_extend_user_key(user.id, days=t_days, create_new=True)
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE users SET trial_used = 1, trial_expires_at = ?, trial_followup_stage = 0 WHERE user_id = ?", (str(until), user.id))
+                conn.commit()
             try:
                 with sqlite3.connect(DB_PATH) as conn:
                     conn.execute("UPDATE user_keys SET key_name = ? WHERE id = ?", (f"🎁 Пробный ключ #{k_id}", k_id))
@@ -6706,6 +7124,8 @@ def build_tariffs_block():
             where_clauses = []
             if "is_active" in cols:
                 where_clauses.append("is_active = 1")
+            if "is_bot" in cols:
+                where_clauses.append("COALESCE(is_bot, 0) = 0")
             where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
             
             order_clauses = []
@@ -8354,6 +8774,7 @@ if __name__ == "__main__":
         app.job_queue.run_repeating(poll_pending_invoices_job, interval=25, first=10)
         app.job_queue.run_repeating(sync_traffic_job, interval=300, first=30)
         app.job_queue.run_repeating(sync_server_nodes_job, interval=600, first=60, name="sync_server_nodes_job")
+        app.job_queue.run_repeating(trial_followup_job, interval=1200, first=120, name="trial_followup_job")
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))

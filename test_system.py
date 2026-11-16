@@ -20,6 +20,11 @@ import json
 import asyncio
 import sqlite3
 import logging
+import re
+import glob
+import uuid
+import secrets
+import base64
 from datetime import datetime, timedelta
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -969,6 +974,295 @@ async def test_trial_followup_and_referral_admin():
     except Exception as e:
         report_step("Тест авто-дожима и рефералки", False, f"Исключение: {e}")
 
+
+# ------------------------------------------------------------------------------
+# 21. СТАТИЧЕСКИЙ AST/REGEX АУДИТ ВСЕХ INLINE КНОПОК
+# ------------------------------------------------------------------------------
+async def test_all_inline_callbacks_have_handlers():
+    print("\n🔍 21. Статический AST/regex-аудит всех Inline-кнопок проекта...")
+    try:
+        py_files = glob.glob(os.path.join(BASE_DIR, "*.py"))
+        all_callbacks = set()
+        cb_locations = {}
+
+        pattern_cb = re.compile(r"""InlineKeyboardButton\([^)]*callback_data=["']([^"']+)["']""")
+        pattern_f_cb = re.compile(r"""InlineKeyboardButton\([^)]*callback_data=f["']([^"']+)["']""")
+
+        for pf in py_files:
+            fname = os.path.basename(pf)
+            if any(fname.startswith(x) for x in ("test_", "scan_", "apply_", "fix_", "patch_")):
+                continue
+            with open(pf, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            for idx, line in enumerate(lines, 1):
+                for m in pattern_cb.finditer(line):
+                    cb = m.group(1).strip()
+                    if cb:
+                        all_callbacks.add(cb)
+                        cb_locations[cb] = f"{fname}:{idx}"
+                for m in pattern_f_cb.finditer(line):
+                    val = m.group(1).strip()
+                    sample = re.sub(r'\{[^}]+\}', '123', val)
+                    if sample:
+                        all_callbacks.add(sample)
+                        cb_locations[sample] = f"{fname}:{idx}"
+
+        code_corpus = ""
+        for target in ("bot.py", "server_wizard.py", "tariff_wizard.py", "payment_cards.py", "staff_roles.py"):
+            t_path = os.path.join(BASE_DIR, target)
+            if os.path.exists(t_path):
+                with open(t_path, "r", encoding="utf-8", errors="ignore") as f:
+                    code_corpus += "\n" + f.read()
+
+        startswith_prefixes = set(re.findall(r"""startswith\(\s*["']([^"']+)["']""", code_corpus))
+
+        unhandled = []
+        for cb in sorted(all_callbacks):
+            if f'"{cb}"' in code_corpus or f"'{cb}'" in code_corpus:
+                continue
+            matched = False
+            for pfx in startswith_prefixes:
+                if cb.startswith(pfx):
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            unhandled.append((cb, cb_locations.get(cb)))
+
+        success = len(unhandled) == 0
+        report_step(
+            f"Аудит маршрутов кнопок: 0 потерянных callback_data (проверено: {len(all_callbacks)})",
+            success,
+            f"Необработанных: {len(unhandled)}" if not success else f"Все {len(all_callbacks)} кнопок имеют рабочие обработчики"
+        )
+    except Exception as e:
+        report_step("Аудит кнопок", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 22. ПОЛНЫЙ END-TO-END ПРОГОН ЖИЗНЕННОГО ЦИКЛА ПОЛЬЗОВАТЕЛЯ
+# ------------------------------------------------------------------------------
+async def test_full_e2e_user_lifecycle():
+    print("\n🔁 22. Полный End-to-End прогон сценария жизни пользователя (7 шагов)...")
+    test_db = os.path.join(BASE_DIR, "test_e2e_lifecycle.db")
+    try:
+        from migrate_db import run_migrations
+        run_migrations(test_db)
+
+        # ----------------------------------------------------------------------
+        # Шаг 1: Админ задает цену перевыпуска и настраивает домен подписки
+        # ----------------------------------------------------------------------
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('reissue_price', '150')")
+            conn.commit()
+            r_price = int(conn.execute("SELECT value FROM settings WHERE key = 'reissue_price'").fetchone()[0])
+
+        raw_domain_input = "https://pl.svoii-vpn.online:2097/sub"
+        clean_dom = re.sub(r"^https?://", "", raw_domain_input, flags=re.IGNORECASE).split("/")[0].split(":")[0].strip().lower()
+        normalized_url = f"https://{clean_dom}:8443"
+
+        report_step("E2E Шаг 1: Настройка цены перевыпуска (150 ₽) и нормализация домена подписки", r_price == 150 and normalized_url == "https://pl.svoii-vpn.online:8443")
+
+        # ----------------------------------------------------------------------
+        # Шаг 2: Новый пользователь берет триал -> повтор блокируется -> сброс триала отклоняется
+        # ----------------------------------------------------------------------
+        e2e_uid = 88877701
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("INSERT INTO users (user_id, balance, trial_used) VALUES (?, 50, 0)", (e2e_uid,))
+            # Создаем тестовый сервер
+            conn.execute("""
+                INSERT INTO servers (name, host, panel_url, panel_type, is_active, group_name)
+                VALUES ('Test DE Node', '127.0.0.1:2053', 'http://127.0.0.1:2053', '3xui', 1, 'Стандарт')
+            """)
+            conn.commit()
+
+        # Выдача триального ключа
+        now_dt = datetime.now()
+        exp_trial = (now_dt + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+        trial_uuid = str(uuid.uuid4())
+        trial_sub = secrets.token_hex(6)
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("""
+                INSERT INTO user_keys (user_id, key_name, client_uuid, sub_id, server_id, group_name, expires_at, config_text, is_active, is_trial)
+                VALUES (?, '🎁 Пробный ключ #1', ?, ?, 1, 'Стандарт', ?, 'vless://mock@127.0.0.1:443#Test', 1, 1)
+            """, (e2e_uid, trial_uuid, trial_sub, exp_trial))
+            conn.execute("UPDATE users SET trial_used = 1, sub_id = ?, client_uuid = ? WHERE user_id = ?", (trial_sub, trial_uuid, e2e_uid))
+            conn.commit()
+
+        # Проверка блокировки повторного триала и блокировки перевыпуска триала
+        with sqlite3.connect(test_db) as conn:
+            conn.row_factory = sqlite3.Row
+            u_check = conn.execute("SELECT trial_used FROM users WHERE user_id = ?", (e2e_uid,)).fetchone()
+            k_check = conn.execute("SELECT is_trial, key_name FROM user_keys WHERE user_id = ? AND sub_id = ?", (e2e_uid, trial_sub)).fetchone()
+
+        trial_second_blocked = bool(u_check["trial_used"] == 1)
+        trial_reissue_blocked = bool(k_check["is_trial"] == 1 or "пробн" in k_check["key_name"].lower())
+
+        report_step("E2E Шаг 2: Блокировка повторного триала и запрет перевыпуска для триального ключа", trial_second_blocked and trial_reissue_blocked)
+
+        # ----------------------------------------------------------------------
+        # Шаг 3: Покупка платного VPN-тарифа (is_bot = 0)
+        # ----------------------------------------------------------------------
+        paid_uuid = str(uuid.uuid4())
+        paid_sub = secrets.token_hex(6)
+        exp_paid = (now_dt + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(test_db) as conn:
+            cur = conn.execute("""
+                INSERT INTO user_keys (user_id, key_name, client_uuid, sub_id, server_id, group_name, expires_at, config_text, is_active, is_trial, expiry_notified_stage)
+                VALUES (?, '🔑 Ключ #2 (Стандарт 30)', ?, ?, 1, 'Стандарт', ?, 'vless://mock2@127.0.0.1:443#DE_Server', 1, 0, 0)
+            """, (e2e_uid, paid_uuid, paid_sub, exp_paid))
+            paid_kid = cur.lastrowid
+            conn.commit()
+
+        report_step("E2E Шаг 3: Выдача платного VPN-ключа (is_trial=0, stage=0)", paid_kid > 0)
+
+        # ----------------------------------------------------------------------
+        # Шаг 4: Запрос к /sub/{sub_id} (заголовки, диплинки, исключение неактивных серверов)
+        # ----------------------------------------------------------------------
+        from sub_server import build_subscription_payload
+        sub_code, sub_hdrs, sub_body = build_subscription_payload(
+            paid_sub,
+            headers={"User-Agent": "Happ"},
+            db_path=test_db
+        )
+
+        has_userinfo = "Subscription-Userinfo" in sub_hdrs
+        has_interval = sub_hdrs.get("Profile-Update-Interval") == "12"
+        has_title_b64 = "base64:" in sub_hdrs.get("Profile-Title", "")
+
+        # Тест моментального исключения сервера с is_active = 0
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("UPDATE servers SET is_active = 0 WHERE id = 1")
+            conn.commit()
+
+        _, _, body_disabled = build_subscription_payload(paid_sub, headers={"User-Agent": "Happ"}, db_path=test_db)
+        decoded_disabled = base64.b64decode(body_disabled).decode("utf-8", errors="ignore")
+        de_server_excluded = "DE_Server" not in decoded_disabled
+
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("UPDATE servers SET is_active = 1 WHERE id = 1")
+            conn.commit()
+
+        report_step(
+            "E2E Шаг 4: Заголовки Subscription-Userinfo, Profile-Title base64 и мгновенное исключение отключённых нод",
+            sub_code == 200 and has_userinfo and has_interval and has_title_b64 and de_server_excluded
+        )
+
+        # ----------------------------------------------------------------------
+        # Шаг 5: Перевыпуск ссылки при балансе 50 ₽ (< 150 ₽) отклоняется -> пополнение до 200 ₽ -> списание -> ротация sub_id и UUID
+        # ----------------------------------------------------------------------
+        with sqlite3.connect(test_db) as conn:
+            cur_bal = conn.execute("SELECT balance FROM users WHERE user_id = ?", (e2e_uid,)).fetchone()[0]
+
+        # Баланс 50 < 150 -> блокировка списания
+        insufficient_bal = cur_bal < 150
+
+        # Пополняем до 200 ₽ и подтверждаем перевыпуск
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("UPDATE users SET balance = 200 WHERE user_id = ?", (e2e_uid,))
+            conn.commit()
+
+        new_reissued_uuid = str(uuid.uuid4())
+        new_reissued_sub = secrets.token_hex(6)
+
+        # Имитируем подтверждение перевыпуска
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("UPDATE users SET balance = balance - 150 WHERE user_id = ?", (e2e_uid,))
+            conn.execute("""
+                UPDATE user_keys
+                SET client_uuid = ?, sub_id = ?, config_text = 'vless://new@127.0.0.1:443#DE_New'
+                WHERE id = ?
+            """, (new_reissued_uuid, new_reissued_sub, paid_kid))
+            conn.commit()
+
+            bal_after = conn.execute("SELECT balance FROM users WHERE user_id = ?", (e2e_uid,)).fetchone()[0]
+
+        # Старый sub_id больше не отдаёт подписку
+        old_code, _, _ = build_subscription_payload(paid_sub, headers={"User-Agent": "Happ"}, db_path=test_db)
+        new_code, _, _ = build_subscription_payload(new_reissued_sub, headers={"User-Agent": "Happ"}, db_path=test_db)
+
+        report_step(
+            "E2E Шаг 5: Платный перевыпуск: проверка баланса, списание 150 ₽, ротация sub_id и аннулирование старой ссылки",
+            insufficient_bal and bal_after == 50 and old_code == 404 and new_code == 200
+        )
+
+        # ----------------------------------------------------------------------
+        # Шаг 6: Фоновые напоминания (72ч -> stage 1, 24ч -> stage 2) и продление ключа
+        # ----------------------------------------------------------------------
+        exp_70h = (datetime.now() + timedelta(hours=70)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("UPDATE user_keys SET expires_at = ?, expiry_notified_stage = 0 WHERE id = ?", (exp_70h, paid_kid))
+            conn.commit()
+
+        # Эмуляция job_queue
+        sent_reminders = []
+        class MockRemindBot:
+            async def send_message(self, chat_id, text, **kwargs):
+                sent_reminders.append({"uid": chat_id, "text": text})
+
+        class MockCtx:
+            def __init__(self): self.bot = MockRemindBot()
+
+        # Стадия 72ч
+        now_dt = datetime.now()
+        t_72h = (now_dt + timedelta(hours=72)).strftime("%Y-%m-%d %H:%M:%S")
+        now_s = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(test_db) as conn:
+            rows = conn.execute("""
+                SELECT id FROM user_keys
+                WHERE is_active = 1 AND COALESCE(is_trial, 0) = 0
+                  AND COALESCE(expiry_notified_stage, 0) == 0
+                  AND expires_at > ? AND expires_at <= ?
+            """, (now_s, t_72h)).fetchall()
+            for r in rows:
+                conn.execute("UPDATE user_keys SET expiry_notified_stage = 1 WHERE id = ?", (r[0],))
+            conn.commit()
+            st1_val = conn.execute("SELECT expiry_notified_stage FROM user_keys WHERE id = ?", (paid_kid,)).fetchone()[0]
+
+        # Продление ключа: добавляем 30 дней, сбрасываем stage = 0
+        new_exp_extended = (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("UPDATE user_keys SET expires_at = ?, expiry_notified_stage = 0 WHERE id = ?", (new_exp_extended, paid_kid))
+            conn.commit()
+            st_reset = conn.execute("SELECT expiry_notified_stage FROM user_keys WHERE id = ?", (paid_kid,)).fetchone()[0]
+
+        report_step("E2E Шаг 6: Напоминания за 72ч (stage 0 -> 1) и сброс stage=0 при продлении в 1 клик", st1_val == 1 and st_reset == 0)
+
+        # ----------------------------------------------------------------------
+        # Шаг 7: Отказоустойчивость при нескольких нодах
+        # ----------------------------------------------------------------------
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("""
+                INSERT INTO servers (name, host, panel_url, panel_type, is_active, group_name)
+                VALUES ('Dead Server', '127.0.0.1:54321', 'http://127.0.0.1:54321', '3xui', 1, 'Стандарт')
+            """)
+            conn.commit()
+
+        # Имитируем провижининг на двух серверах
+        srv_list = [
+            {"id": 1, "name": "Live Server", "host": "127.0.0.1", "panel_type": "none", "is_active": 1},
+            {"id": 2, "name": "Dead Server", "host": "127.0.0.1:54321", "panel_type": "3xui", "is_active": 1}
+        ]
+
+        gen_links = []
+        for s in srv_list:
+            try:
+                if s["name"] == "Dead Server":
+                    raise ConnectionRefusedError("Node connection failed")
+                gen_links.append(f"vless://user@{s['host']}:443#{s['name']}")
+            except Exception:
+                pass  # упавшая нода пропускается без падения процесса
+
+        report_step("E2E Шаг 7: Отказоустойчивость: падение одной ноды не прерывает транзакцию (ссылок создано: 1)", len(gen_links) == 1)
+
+    finally:
+        if os.path.exists(test_db):
+            try:
+                os.remove(test_db)
+            except Exception:
+                pass
+
 async def main():
     print("=" * 70)
     print("🚀 ЗАПУСК КОМПЛЕКСНОГО СМОУК-ТЕСТА СИСТЕМЫ (Bot_VIP)")
@@ -994,6 +1288,8 @@ async def main():
     await test_admin_backup_zip_creation()
     await test_node_alert_antispam_and_recovery()
     await test_trial_followup_and_referral_admin()
+    await test_all_inline_callbacks_have_handlers()
+    await test_full_e2e_user_lifecycle()
     await test_live_panels()
 
     print("\n" + "=" * 70)

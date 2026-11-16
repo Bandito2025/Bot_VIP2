@@ -235,15 +235,31 @@ mkdir -p /etc/caddy
 cat > /etc/caddy/Caddyfile << EOF
 {
     https_port 8443
+    servers {
+        protocols h1 h2
+    }
 }
 
-${CADDY_DOMAIN} {
+${CADDY_DOMAIN}:8443 {
     reverse_proxy 127.0.0.1:2097
 }
 EOF
 
 systemctl enable --now caddy
-systemctl reload caddy || systemctl restart caddy
+systemctl restart caddy
+
+# Создание глобальной команды быстрого обновления bot-update
+cat > /usr/local/bin/bot-update << 'EOF'
+#!/usr/bin/env bash
+set -e
+echo "🔄 Запуск обновления Bot_VIP2..."
+cd /opt/Bot_VIP
+git pull origin main
+/opt/Bot_VIP/venv/bin/python3 migrate_db.py
+systemctl restart bot_vip caddy
+echo "✅ Bot_VIP2 успешно обновлен и перезапущен!"
+EOF
+chmod +x /usr/local/bin/bot-update 2>/dev/null || true
 
 cat > /etc/systemd/system/bot_vip.service << EOF
 [Unit]
@@ -291,7 +307,8 @@ echo "        первый сервер (3X-UI, WPP или Гибрид) чер�
 echo "     3. В разделе «Оплата и Тарифы» настройте тарифы и платежи"
 echo ""
 echo "  🛠 ПОЛЕЗНЫЕ КОМАНДЫ:"
-echo "     • Просмотр логов бота:  journalctl -u bot_vip -f"
+echo "     • Быстрое обновление:   bot-update
+     • Просмотр логов бота:  journalctl -u bot_vip -f"
 echo "     • Перезапуск бота:      systemctl restart bot_vip"
 echo "     • Проверка Caddy:       systemctl status caddy"
 echo "=========================================================="

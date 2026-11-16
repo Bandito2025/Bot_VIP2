@@ -488,6 +488,32 @@ class MultiPanelManager:
         return {"up": total_up, "down": total_down, "total": total_up + total_down}
 
     @classmethod
+    async def deprovision_on_server(cls, server: dict, user_id: int, key_id: int, client_uuid: str = "", remote_email: str = None, remote_id: str = None) -> bool:
+        """Полное удаление старого клиента с ноды (3X-UI и WPP) при ротации UUID / перевыпуске ссылки"""
+        srv = cls.normalize_server_dict(server)
+        p_type = str(srv.get("panel_type") or "3xui").lower()
+        panel_url = srv.get("panel_url", "")
+        email = remote_email or f"user_{user_id}_k{key_id}"
+
+        # Удаление из 3X-UI
+        if p_type in ("3xui", "3x-ui", "both") and panel_url:
+            try:
+                adapter = XUIAdapter(panel_url, srv.get("panel_user", ""), srv.get("panel_pass", ""))
+                await adapter.delete_client(email)
+            except Exception as e:
+                logger.warning(f"Error deprovisioning client on 3X-UI ({srv.get('name')}): {e}")
+
+        # Удаление из WPP
+        if p_type in ("wpp", "web_panel_proxy", "both"):
+            try:
+                wpp = WPPClient(server=srv)
+                await wpp.delete_profile_async(remote_id or f"{user_id}_{key_id}")
+            except Exception as e:
+                logger.warning(f"Error deprovisioning client on WPP ({srv.get('name')}): {e}")
+
+        return True
+
+    @classmethod
     async def deactivate_on_server(cls, server: dict, user_id: int, key_id: int, remote_email: str = None, remote_id: str = None) -> bool:
         """Отключение клиента на ноде при окончании подписки или исчерпании лимита"""
         srv = cls.normalize_server_dict(server)

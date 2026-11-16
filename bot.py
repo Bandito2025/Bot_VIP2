@@ -366,6 +366,19 @@ if not os.path.isabs(LOG_PATH):
 SUB_PORT = int(os.getenv("SUB_PORT", "2097"))
 
 
+def get_server_external_ip() -> str:
+    """Определяет внешний IPv4-адрес сервера"""
+    import urllib.request
+    for url in ("https://ifconfig.me/ip", "https://api.ipify.org", "https://icanhazip.com"):
+        try:
+            with urllib.request.urlopen(url, timeout=4) as resp:
+                ip = resp.read().decode("utf-8").strip()
+                if ip and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                    return ip
+        except Exception:
+            pass
+    return "127.0.0.1"
+
 def normalize_sub_base_url(raw: str) -> str:
     """
     Преобразует произвольный хост/URL в стандартный формат https://HOST:8443.
@@ -1788,7 +1801,7 @@ async def create_or_extend_user_key(user_id: int, days: int = 30, create_new: bo
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE user_keys SET expires_at = ?, config_text = ?, group_name = ?, is_active = 1, warned_24h = 0, warned_3h = 0 WHERE id = ?",
+            "UPDATE user_keys SET expires_at = ?, config_text = ?, group_name = ?, is_active = 1, warned_24h = 0, warned_3h = 0, expiry_notified_stage = 0 WHERE id = ?",
             (new_until_str, combined_text, grp, k_id)
         )
         conn.execute("""
@@ -1808,58 +1821,92 @@ async def build_unified_subscription_for_user(user_id: int, days: int = 30) -> t
 # ⏰ ФОНОВЫЕ НАПОМИНАНИЯ ОБ ИСТЕЧЕНИИ ПОДПИСКИ (ЗА 24 ЧАСА И 3 ЧАСА)
 # ==============================================================================
 async def check_expiry_reminders_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Фоновые напоминания об окончании платной подписки:
+    - За 72 часа (stage 0 -> 1): напоминание с кнопкой продления в 1 клик
+    - За 24 часа (stage 1 -> 2): финальное напоминание
+    Только для активных платных ключей (is_trial = 0)!
+    """
     now = datetime.now()
-    t_24h = (now + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-    t_3h = (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    t_72h = (now + timedelta(hours=72)).strftime("%Y-%m-%d %H:%M:%S")
+    t_24h = (now + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
 
-    with sqlite3.connect(DB_PATH) as conn:
-        rows_24 = conn.execute("""
-            SELECT id, user_id, key_name, expires_at FROM user_keys
-            WHERE is_active = 1 AND warned_24h = 0 AND expires_at != '' AND expires_at != 'Без срока'
-            AND expires_at > ? AND expires_at <= ?
-        """, (now_str, t_24h)).fetchall()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
 
-        for kid, uid, kname, exp in rows_24:
-            conn.execute("UPDATE user_keys SET warned_24h = 1 WHERE id = ?", (kid,))
-            conn.commit()
-            try:
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⏳ Продлить подписку в 1 клик", callback_data="order_vpn")],
-                    [InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")]
-                ])
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=f"⚠️ <b>Напоминание: срок действия вашего ключа ({html.escape(kname)}) истекает менее чем через 24 часа (до <code>{exp}</code>).</b>\nПродлите подписку заранее, чтобы сохранить бесперебойный доступ:",
-                    parse_mode="HTML",
-                    reply_markup=kb
-                )
-            except Forbidden:
-                mark_user_blocked_bot(uid, 1)
-            except Exception:
-                pass
+            # 1. Напоминание за 72 часа (stage == 0)
+            rows_72 = conn.execute("""
+                SELECT id, user_id, key_name, expires_at FROM user_keys
+                WHERE is_active = 1 AND COALESCE(is_trial, 0) = 0
+                  AND COALESCE(expiry_notified_stage, 0) == 0
+                  AND expires_at != '' AND expires_at != 'Без срока'
+                  AND expires_at > ? AND expires_at <= ?
+                  AND key_name NOT LIKE '%Пробный%'
+            """, (now_str, t_72h)).fetchall()
 
-        rows_3 = conn.execute("""
-            SELECT id, user_id, key_name, expires_at FROM user_keys
-            WHERE is_active = 1 AND warned_3h = 0 AND expires_at != '' AND expires_at != 'Без срока'
-            AND expires_at > ? AND expires_at <= ?
-        """, (now_str, t_3h)).fetchall()
+            for r in rows_72:
+                kid = r["id"]
+                uid = r["user_id"]
+                kname = r["key_name"] or f"Ключ #{kid}"
+                exp = r["expires_at"]
+                conn.execute("UPDATE user_keys SET expiry_notified_stage = 1, warned_24h = 0 WHERE id = ?", (kid,))
+                conn.commit()
+                try:
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⚡ Продлить ключ", callback_data=f"renew_key_{kid}")],
+                        [InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")]
+                    ])
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            f"⏳ <b>Напоминание: срок действия подписки истекает!</b>\n\n"
+                            f"Ваш VPN-ключ <b>{html.escape(kname)}</b> заканчивается через 3 дня (до <code>{exp}</code>).\n"
+                            f"Продлите доступ заранее, чтобы оставаться под надёжной защитой без прерывания связи:"
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=kb
+                    )
+                except Exception as _e72:
+                    logger.debug(f"Reminder 72h send error for {uid}: {_e72}")
 
-        for kid, uid, kname, exp in rows_3:
-            conn.execute("UPDATE user_keys SET warned_3h = 1 WHERE id = ?", (kid,))
-            conn.commit()
-            try:
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Продлить подписку сейчас", callback_data="order_vpn")]])
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=f"🚨 <b>Внимание! Ваш ключ ({html.escape(kname)}) отключится через 3 часа (в <code>{exp}</code>)!</b>",
-                    parse_mode="HTML",
-                    reply_markup=kb
-                )
-            except Forbidden:
-                mark_user_blocked_bot(uid, 1)
-            except Exception:
-                pass
+            # 2. Финальное напоминание за 24 часа (stage == 1)
+            rows_24 = conn.execute("""
+                SELECT id, user_id, key_name, expires_at FROM user_keys
+                WHERE is_active = 1 AND COALESCE(is_trial, 0) = 0
+                  AND COALESCE(expiry_notified_stage, 0) == 1
+                  AND expires_at != '' AND expires_at != 'Без срока'
+                  AND expires_at > ? AND expires_at <= ?
+                  AND key_name NOT LIKE '%Пробный%'
+            """, (now_str, t_24h)).fetchall()
+
+            for r in rows_24:
+                kid = r["id"]
+                uid = r["user_id"]
+                kname = r["key_name"] or f"Ключ #{kid}"
+                exp = r["expires_at"]
+                conn.execute("UPDATE user_keys SET expiry_notified_stage = 2, warned_24h = 1 WHERE id = ?", (kid,))
+                conn.commit()
+                try:
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⚡ Продлить ключ", callback_data=f"renew_key_{kid}")],
+                        [InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")]
+                    ])
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            f"🚨 <b>Внимание: последний день действия подписки!</b>\n\n"
+                            f"Ваш VPN-ключ <b>{html.escape(kname)}</b> будет отключен менее чем через 24 часа (в <code>{exp}</code>).\n"
+                            f"Продлите подписку в 1 клик, сохранив все настройки и привязанные серверы:"
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=kb
+                    )
+                except Exception as _e24:
+                    logger.debug(f"Reminder 24h send error for {uid}: {_e24}")
+    except Exception as e:
+        logger.error(f"check_expiry_reminders_job error: {e}")
 
 # ==============================================================================
 # ⚙️ МОДУЛЬ "НАСТРОЙКИ БОТА" И АВТО-ОБНОВЛЕНИЕ ПРЯМО ИЗ БОТА
@@ -1873,6 +1920,7 @@ def render_bot_settings_main_screen() -> tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton("🔄 Обновления", callback_data="admin_bset_updates")],
         [InlineKeyboardButton("🌐 Веб и Mini App", callback_data="admin_bset_webapp")],
         [InlineKeyboardButton("📢 Новостной канал (для триала)", callback_data="admin_bset_news_chan")],
+        [InlineKeyboardButton(f"🔄 Цена перевыпуска ({get_setting('reissue_price', '100')} ₽)", callback_data="admin_reissue_price_edit")],
         [InlineKeyboardButton("💾 Скачать бэкап сейчас", callback_data="admin_backup_now")],
         [InlineKeyboardButton("📱 Ограничение устройств", callback_data="admin_bset_devices")],
         [InlineKeyboardButton("✏️ Изменить тексты", callback_data="admin_bset_texts")],
@@ -3918,6 +3966,47 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
     data = query.data
+    # --- АЛИАСЫ И РОУТЫ ---
+    if data in ("admin_home", "admin_back_main"):
+        await query.answer()
+        text_out, kb_out = render_admin_main_screen()
+        await query.message.edit_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data in ("admin_btn_settings", "admin_settings_menu"):
+        await query.answer()
+        text_out, kb_out = render_bot_settings_main_screen()
+        await query.message.edit_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data in ("buy_vpn", "user_tariffs"):
+        data = "order_vpn"
+
+    if data == "help_connect":
+        await query.answer()
+        help_text = (
+            "📖 <b>Инструкция по подключению VPN:</b>\n\n"
+            "1. Установите приложение для вашей системы: <b>Happ</b>, <b>v2rayTun</b>, <b>Streisand</b> или <b>Hiddify</b>.\n"
+            "2. Перейдите в раздел <b>«🔑 Мои ключи»</b> и нажмите на ссылку подписки или отсканируйте QR-код.\n"
+            "3. В приложении включите переключатель VPN для безопасного выхода в интернет! 🚀"
+        )
+        kb_h = InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")]])
+        await query.message.edit_text(help_text, parse_mode="HTML", reply_markup=kb_h)
+        return
+
+    if data and data.startswith("admin_srv_"):
+        srv_id = int(data.split("_")[-1])
+        text_s, kb_s = render_server_details_screen(srv_id) if "render_server_details_screen" in globals() else (f"Сервер #{srv_id}", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К серверам", callback_data="admin_servers")]]))
+        await query.message.edit_text(text_s, parse_mode="HTML", reply_markup=kb_s)
+        return
+
+    if data and data.startswith("key_loc_"):
+        k_id = int(data.split("_")[-1])
+        data = f"client_key_loc_{k_id}"
+
+    if data and data.startswith("key_ren_"):
+        k_id = int(data.split("_")[-1])
+        data = f"client_key_ren_{k_id}"
     if data == 'admin_tariffs':
         data = 'admin_tariffs_list'
         query.data = 'admin_tariffs_list'
@@ -6066,9 +6155,17 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_set_subdom":
         context.user_data["mode"] = "set_subdom"
+        srv_ip = get_server_external_ip()
         await query.edit_message_text(
             "🌐 <b>Настройка единого домена подписки (Subscription URL)</b>\n\n"
-            "Отправьте базовый URL (например: <code>https://sub.svoii-vpn.online:2097/sub</code>):",
+            "Отправьте чистое доменное имя без протокола, портов и путей.\n"
+            "Пример: <code>sub.svoii-vpn.online</code> или <code>pl.svoii-vpn.online</code>\n\n"
+            "ℹ️ <b>Совместимость с доменом панели:</b>\n"
+            "• ✅ <b>Можно</b> указать домен панели (3X-UI / WPP), если она установлена <b>на этом же сервере</b>, "
+            "что и бот (подписки работают на отдельном порту TCP :8443 и не мешают ни VPN, ни панели).\n"
+            "• ❌ <b>Нельзя</b> указывать домен от <b>другого сервера</b> — для него создайте отдельный поддомен "
+            f"(например, <code>sub.ваш-домен.ru</code>) и направьте его A-запись на IP этого сервера бота (<code>{srv_ip}</code>).\n\n"
+            "⚠️ Бот автоматически сконфигурирует Caddy и выпустит бесплатный SSL-сертификат Let's Encrypt на порту 8443.",
             parse_mode="HTML"
         )
         return
@@ -6223,6 +6320,252 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # --- Обработка текстовых сообщений ---
+
+    # --- ОБРАБОТЧИКИ ПЕРЕВЫПУСКА ССЫЛКИ И ПРОДЛЕНИЯ КЛЮЧА ---
+    if data.startswith("reissue_key_"):
+        k_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            k_row = conn.execute("SELECT id, user_id, key_name, is_trial FROM user_keys WHERE id = ? AND user_id = ?", (k_id, user.id)).fetchone()
+            u_row = conn.execute("SELECT balance FROM users WHERE user_id = ?", (user.id,)).fetchone()
+
+        if not k_row:
+            await query.answer("❌ Ключ не найден.", show_alert=True)
+            return
+
+        is_trial_key = bool(k_row["is_trial"] == 1 or "пробн" in (k_row["key_name"] or "").lower())
+        if is_trial_key:
+            await query.answer("⚠️ Сброс устройств и перевыпуск ссылки доступны только для платных подписок.", show_alert=True)
+            return
+
+        r_price = int(get_setting("reissue_price", "100") or 100)
+        u_bal = float(u_row["balance"] if u_row and u_row["balance"] is not None else 0.0)
+        p_str = f"<b>{r_price} ₽</b>" if r_price > 0 else "<b>0 ₽ (включено в подписку)</b>"
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, перевыпустить", callback_data=f"confirm_reissue_{k_id}")],
+            [InlineKeyboardButton("⬅️ Отмена", callback_data=f"client_key_view_{k_id}")]
+        ])
+        await query.message.edit_text(
+            f"🔄 <b>Перевыпуск ссылки подписки и сброс устройств</b>\n\n"
+            f"🔑 Ключ: <b>{html.escape(k_row['key_name'] or f'Ключ #{k_id}')}</b>\n"
+            f"💰 Стоимость услуги: {p_str}\n"
+            f"💳 Ваш баланс: <b>{u_bal:.2f} ₽</b>\n\n"
+            f"⚠️ <b>Внимание:</b> Ваша текущая ссылка подписки перестанет работать на всех ранее подключённых устройствах! Будут сгенерированы новые реквизиты доступа.\n\n"
+            f"Подтверждаете операцию?",
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+        return
+
+    if data.startswith("confirm_reissue_"):
+        k_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            k_row = conn.execute("SELECT * FROM user_keys WHERE id = ? AND user_id = ?", (k_id, user.id)).fetchone()
+            u_row = conn.execute("SELECT balance FROM users WHERE user_id = ?", (user.id,)).fetchone()
+
+        if not k_row:
+            await query.answer("❌ Ключ не найден.", show_alert=True)
+            return
+
+        is_trial_key = bool(k_row["is_trial"] == 1 or "пробн" in (k_row["key_name"] or "").lower())
+        if is_trial_key:
+            await query.answer("⚠️ Сброс устройств и перевыпуск ссылки доступны только для платных подписок.", show_alert=True)
+            return
+
+        r_price = int(get_setting("reissue_price", "100") or 100)
+        u_bal = float(u_row["balance"] if u_row and u_row["balance"] is not None else 0.0)
+
+        if r_price > 0 and u_bal < r_price:
+            diff = r_price - u_bal
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Пополнить баланс", callback_data="order_vpn")],
+                [InlineKeyboardButton("⬅️ Назад к ключу", callback_data=f"client_key_view_{k_id}")]
+            ])
+            await query.message.edit_text(
+                f"❌ <b>Недостаточно средств на балансе!</b>\n\n"
+                f"Стоимость перевыпуска: <b>{r_price} ₽</b>\n"
+                f"Ваш текущий баланс: <b>{u_bal:.2f} ₽</b>\n"
+                f"Не хватает: <b>{diff:.2f} ₽</b>\n\n"
+                f"Пополните баланс в боте и повторите попытку.",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+            return
+
+        await query.answer("⏳ Перевыпускаю ссылку...")
+
+        # 1. Списание средств с баланса
+        if r_price > 0:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (r_price, user.id))
+                conn.commit()
+
+        # 2. Ротация UUID и sub_id
+        old_uuid = k_row["client_uuid"]
+        old_sub_id = k_row["sub_id"]
+        grp = k_row["group_name"] or "Стандарт"
+        exp_str = k_row["expires_at"] or ""
+        lim_gb = float(k_row["limit_gb"] or 0)
+
+        new_uuid = str(uuid.uuid4())
+        new_sub_id = secrets.token_hex(6)
+
+        # Вычисляем expiry_ms
+        expiry_ms = 0
+        if exp_str and exp_str != "Без срока":
+            try:
+                exp_dt = datetime.strptime(exp_str.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                expiry_ms = int(exp_dt.timestamp() * 1000)
+            except Exception:
+                pass
+
+        # 3. Удаление старых клиентов на нодах (deprovision)
+        servers = get_servers_for_group(grp)
+        for srv in servers:
+            try:
+                await MultiPanelManager.deprovision_on_server(srv, user.id, k_id, client_uuid=old_uuid)
+            except Exception as _dep_err:
+                logger.warning(f"Deprovision error on server {srv}: {_dep_err}")
+
+        # Очистка привязанных устройств
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM key_devices WHERE key_id = ?", (k_id,))
+            conn.commit()
+
+        # 4. Провижининг новых реквизитов на нодах
+        gen_links = []
+        for srv in servers:
+            try:
+                res = await MultiPanelManager.provision_on_server(srv, user.id, k_id, new_uuid, new_sub_id, expiry_ms)
+                if res.links:
+                    gen_links.extend(res.links)
+            except Exception as _p_err:
+                logger.warning(f"Re-provision error on server {srv}: {_p_err}")
+
+        comb_cfg = "\n".join(gen_links)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE user_keys SET client_uuid = ?, sub_id = ?, config_text = ? WHERE id = ?",
+                (new_uuid, new_sub_id, comb_cfg, k_id)
+            )
+            conn.execute(
+                "UPDATE users SET client_uuid = ?, sub_id = ?, vpn_config = ? WHERE user_id = ?",
+                (new_uuid, new_sub_id, comb_cfg, user.id)
+            )
+            conn.commit()
+
+        new_sub_url = get_clean_sub_url(new_sub_id)
+        kb_done = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📲 Показать QR-код", callback_data=f"client_key_qr_{k_id}")],
+            [InlineKeyboardButton("🔑 К ключу", callback_data=f"client_key_view_{k_id}")],
+            [InlineKeyboardButton("🈴 На главную", callback_data="start_back_main")]
+        ])
+        await query.message.edit_text(
+            f"✅ <b>Ссылка подписки успешно перевыпущена!</b>\n\n"
+            f"Все старые подключения отключены.\n\n"
+            f"🔗 <b>Новая ссылка подписки:</b>\n<code>{new_sub_url}</code>\n\n"
+            f"Импортируйте её в ваше приложение (Happ, v2rayTun, Hiddify, Streisand) или отсканируйте QR-код.",
+            parse_mode="HTML",
+            reply_markup=kb_done
+        )
+        return
+
+    if data.startswith("renew_key_"):
+        k_id = int(data.split("_")[-1])
+        tariffs = get_active_tariffs(for_bot=False)
+        if not tariffs:
+            await query.answer("Тарифы временно обновляются.", show_alert=True)
+            return
+
+        kb_rows = []
+        for t_id, grp, name, days, price, stars in tariffs:
+            kb_rows.append([
+                InlineKeyboardButton(f"⚡ {name} — {price} ₽", callback_data=f"pay_key_{k_id}_{t_id}")
+            ])
+        kb_rows.append([InlineKeyboardButton("⬅️ Назад к ключу", callback_data=f"client_key_view_{k_id}")])
+
+        await query.message.edit_text(
+            f"⚡ <b>Продление VPN-ключа #{k_id}</b>\n\n"
+            f"Выберите тариф для продления подписки.\n"
+            f"Текущая ссылка и настройки подключения сохранятся, а дни добавятся к сроку действия:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb_rows)
+        )
+        return
+
+    if data.startswith("pay_key_"):
+        parts = data.split("_")
+        k_id = int(parts[2])
+        t_id = int(parts[3])
+        t_row = get_tariff_by_id(t_id)
+        if not t_row:
+            await query.answer("Тариф не найден.", show_alert=True)
+            return
+
+        _, grp, t_name, t_days, price_rub, stars = t_row
+        with sqlite3.connect(DB_PATH) as conn:
+            u_row = conn.execute("SELECT balance FROM users WHERE user_id = ?", (user.id,)).fetchone()
+        u_bal = float(u_row[0] if u_row and u_row[0] is not None else 0.0)
+
+        pay_buttons = []
+        if u_bal >= price_rub:
+            pay_buttons.append([
+                InlineKeyboardButton(f"💳 Оплатить с баланса ({price_rub} ₽)", callback_data=f"pay_bal_k_{k_id}_{t_id}")
+            ])
+        for p_key, p_info in PAYMENT_PROVIDERS.items():
+            if get_setting(f"pay_{p_key}_enabled", "0") == "1":
+                pay_buttons.append([
+                    InlineKeyboardButton(f"💳 Оплатить {price_rub} ₽ через {p_info['title']}", callback_data=f"pay_exec_{p_key}_tariff_{t_id}")
+                ])
+        pay_buttons.append([InlineKeyboardButton("⬅️ Назад к тарифам", callback_data=f"renew_key_{k_id}")])
+
+        await query.message.edit_text(
+            f"💳 <b>Оплата продления Ключа #{k_id}</b>\n\n"
+            f"Тариф: <b>{html.escape(t_name)}</b> (+{t_days} дн.)\n"
+            f"К оплате: <b>{price_rub} ₽</b>\n"
+            f"Ваш баланс: <b>{u_bal:.2f} ₽</b>\n\n"
+            f"Выберите удобный способ оплаты:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(pay_buttons)
+        )
+        return
+
+    if data.startswith("pay_bal_k_"):
+        parts = data.split("_")
+        k_id = int(parts[3])
+        t_id = int(parts[4])
+        t_row = get_tariff_by_id(t_id)
+        if not t_row:
+            await query.answer("Тариф не найден.", show_alert=True)
+            return
+
+        _, grp, t_name, t_days, price_rub, stars = t_row
+        with sqlite3.connect(DB_PATH) as conn:
+            u_row = conn.execute("SELECT balance FROM users WHERE user_id = ?", (user.id,)).fetchone()
+            u_bal = float(u_row[0] if u_row and u_row[0] is not None else 0.0)
+            if u_bal < price_rub:
+                await query.answer("Недостаточно средств на балансе.", show_alert=True)
+                return
+            conn.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price_rub, user.id))
+            conn.commit()
+
+        # Продление ключа
+        k_id, new_until, sub_url, _ = await create_or_extend_user_key(user.id, days=t_days, create_new=False, key_id=k_id, tariff_id=t_id)
+        await query.answer("🎉 Подписка успешно продлена!", show_alert=True)
+        text_out, kb_out = await render_single_key_control(user.id, k_id)
+        await query.message.edit_text(
+            f"✅ <b>Ключ #{k_id} успешно продлен на +{t_days} дн.!</b>\nДействует до: <code>{new_until}</code>\n\n{text_out}",
+            parse_mode="HTML",
+            reply_markup=kb_out
+        )
+        return
+
+    if data.startswith("trial_info_"):
+        await query.answer("ℹ️ Это бесплатный пробный ключ. Платный перевыпуск и сброс доступны после перехода на платный тариф.", show_alert=True)
+        return
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await tariff_wizard.handle_tariff_text_input(update, context):
         return
@@ -6620,11 +6963,136 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"✅ Шаблон VIP Proxy сохранен для сервера #{srv_id}!", reply_markup=admin_dashboard_keyboard())
             return
 
+        elif mode == "edit_reissue_price":
+            context.user_data["mode"] = None
+            try:
+                p_val = max(0, int(text.strip()))
+                set_setting("reissue_price", str(p_val))
+                text_out, kb_out = render_bot_settings_main_screen()
+                p_info = f"<b>{p_val} ₽</b>" if p_val > 0 else "<b>0 ₽ (Бесплатно / включено в подписку)</b>"
+                await msg.reply_text(f"✅ Стоимость перевыпуска ссылки установлена: {p_info}\n\n{text_out}", parse_mode="HTML", reply_markup=kb_out)
+            except ValueError:
+                await msg.reply_text("❌ Введите корректное число (например: 100 или 0 для бесплатного сброса).")
+            return
+
         elif mode == "set_subdom":
             context.user_data["mode"] = None
-            set_setting("sub_domain_prefix", text.strip())
+            raw_input = text.strip()
+            clean_dom = re.sub(r"^https?://", "", raw_input, flags=re.IGNORECASE)
+            clean_dom = clean_dom.split("/")[0].split(":")[0].strip().lower()
+
+            if not clean_dom:
+                await msg.reply_text("❌ Введено пустое доменное имя.")
+                return
+
+            srv_ip = get_server_external_ip()
+
+            # Проверка DNS A-записи
+            resolved_ip = ""
+            try:
+                resolved_ip = socket.gethostbyname(clean_dom)
+            except Exception:
+                resolved_ip = ""
+
+            if clean_dom not in ("localhost", "127.0.0.1") and srv_ip != "127.0.0.1":
+                if not resolved_ip:
+                    await msg.reply_text(
+                        f"❌ <b>Ошибка DNS:</b> Домен <code>{html.escape(clean_dom)}</code> не резолвится.\n\n"
+                        f"Создайте A-запись у вашего регистратора и направьте её на IP сервера: <code>{srv_ip}</code>.\n"
+                        f"После распространения DNS повторите настройку.",
+                        parse_mode="HTML"
+                    )
+                    return
+                if resolved_ip != srv_ip:
+                    await msg.reply_text(
+                        f"❌ <b>Неверная A-запись!</b>\n\n"
+                        f"Домен <code>{html.escape(clean_dom)}</code> указывает на IP <code>{resolved_ip}</code>, "
+                        f"а текущий сервер бота имеет IP <code>{srv_ip}</code>.\n\n"
+                        f"Направьте A-запись домена на IP: <code>{srv_ip}</code> и повторите попытку.",
+                        parse_mode="HTML"
+                    )
+                    return
+
+            wait_msg = await msg.reply_text(f"⏳ Настраиваю HTTPS и выпускаю SSL-сертификат для <code>{clean_dom}:8443</code>...", parse_mode="HTML")
+
+            # Генерация Caddyfile с protocols h1 h2
+            caddy_dir = "/etc/caddy"
+            caddyfile_path = os.path.join(caddy_dir, "Caddyfile")
+            caddy_content = f"""{{
+    https_port 8443
+    servers {{
+        protocols h1 h2
+    }}
+}}
+
+{clean_dom}:8443 {{
+    reverse_proxy 127.0.0.1:2097
+}}
+"""
+            caddy_err_log = ""
+            if os.path.exists(caddy_dir) or sys.platform.startswith("linux"):
+                try:
+                    os.makedirs(caddy_dir, exist_ok=True)
+                    with open(caddyfile_path, "w", encoding="utf-8") as cf:
+                        cf.write(caddy_content)
+                    subprocess.run(["caddy", "fmt", "--overwrite", caddyfile_path], capture_output=True)
+                    res_c = subprocess.run(["systemctl", "restart", "caddy"], capture_output=True, text=True)
+                    if res_c.returncode == 0:
+                        await asyncio.sleep(3)
+                    else:
+                        caddy_err_log = res_c.stderr or res_c.stdout
+                except Exception as _ce:
+                    caddy_err_log = str(_ce)
+
+            new_sub_url = f"https://{clean_dom}:8443"
+            os.environ["SUB_BASE_URL"] = new_sub_url
+            set_setting("sub_base_url", new_sub_url)
+            set_setting("sub_domain_prefix", new_sub_url)
+
+            # Обновление .env файлов
+            env_paths = ["/opt/Bot_VIP/.env", os.path.join(BASE_DIR, ".env"), "/root/env.bak"]
+            for ep in env_paths:
+                if os.path.exists(ep):
+                    try:
+                        with open(ep, "r", encoding="utf-8") as ef:
+                            lines = ef.readlines()
+                        new_lines = []
+                        sub_found = False
+                        for l in lines:
+                            if l.strip().startswith("SUB_BASE_URL="):
+                                new_lines.append(f"SUB_BASE_URL={new_sub_url}\n")
+                                sub_found = True
+                            else:
+                                new_lines.append(l)
+                        if not sub_found:
+                            new_lines.append(f"SUB_BASE_URL={new_sub_url}\n")
+                        with open(ep, "w", encoding="utf-8") as ef:
+                            ef.writelines(new_lines)
+                    except Exception:
+                        pass
+
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+
             text_out, kb_out = render_bot_settings_main_screen()
-            await msg.reply_text(f"✅ Глобальный URL единой подписки сохранен:\n<code>{html.escape(text.strip())}</code>\n\n{text_out}", parse_mode="HTML", reply_markup=kb_out)
+            if caddy_err_log:
+                await msg.reply_text(
+                    f"⚠️ <b>Домен сохранён:</b> <code>{new_sub_url}</code>\n"
+                    f"Однако Caddy вернул предупреждение при перезапуске:\n<code>{html.escape(caddy_err_log[:300])}</code>\n\n{text_out}",
+                    parse_mode="HTML",
+                    reply_markup=kb_out
+                )
+            else:
+                await msg.reply_text(
+                    f"✅ <b>SSL-сертификат и единый домен подписки успешно настроены!</b>\n\n"
+                    f"🌐 Хост: <code>{clean_dom}:8443</code>\n"
+                    f"🔗 Базовый URL: <code>{new_sub_url}</code>\n"
+                    f"🔒 Порт TCP 8443 активен с поддержкой HTTP/1.1 и HTTP/2 (protocols h1 h2).\n\n{text_out}",
+                    parse_mode="HTML",
+                    reply_markup=kb_out
+                )
             return
 
         elif mode == "add_vpn_pool":

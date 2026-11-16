@@ -84,6 +84,8 @@ def run_migrations(db_path: str = None) -> bool:
                 is_active INTEGER DEFAULT 1,
                 warned_24h INTEGER DEFAULT 0,
                 warned_3h INTEGER DEFAULT 0,
+                expiry_notified_stage INTEGER DEFAULT 0,
+                is_trial INTEGER DEFAULT 0,
                 history_log TEXT DEFAULT '',
                 created_at TEXT
             );
@@ -371,6 +373,8 @@ def run_migrations(db_path: str = None) -> bool:
             "is_active": "INTEGER DEFAULT 1",
             "warned_24h": "INTEGER DEFAULT 0",
             "warned_3h": "INTEGER DEFAULT 0",
+            "expiry_notified_stage": "INTEGER DEFAULT 0",
+            "is_trial": "INTEGER DEFAULT 0",
             "history_log": "TEXT DEFAULT ''"
         })
 
@@ -440,6 +444,8 @@ def run_migrations(db_path: str = None) -> bool:
         except Exception as e:
             logger.warning(f"Ошибка авторазметки тарифов бота: {e}")
 
+                # Инициализация настроек по умолчанию
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('reissue_price', '100');")
         conn.commit()
         conn.close()
         logger.info(f"✅ Миграция БД успешно завершена для {target}")

@@ -220,6 +220,14 @@ def build_subscription_payload(sub_id: str, headers: dict = None, query: str = "
             else:
                 return 404, {"Content-Type": "text/plain; charset=utf-8"}, b"Subscription not found"
 
+        # Список неактивных серверов для моментального исключения из выдачи
+        inactive_srvs = []
+        try:
+            cur.execute("SELECT name, host FROM servers WHERE is_active = 0")
+            inactive_srvs = cur.fetchall()
+        except Exception:
+            pass
+
     # Проверка активности подписки
     if not is_active:
         msg = "⚠️ Ваша подписка истекла или отключена. Для продления перейдите в бота."
@@ -250,7 +258,7 @@ def build_subscription_payload(sub_id: str, headers: dict = None, query: str = "
             pass
 
     # 3. Формирование актуальных конфигов
-    # Фильтрация битых или неполных Reality ссылок (с пустым pbk)
+    # Фильтрация битых или неполных Reality ссылок и моментальное исключение отключенных серверов (is_active = 0)
     cleaned_lines = []
     for line in cfg_saved.splitlines():
         l_str = line.strip()
@@ -259,6 +267,26 @@ def build_subscription_payload(sub_id: str, headers: dict = None, query: str = "
         if "security=reality" in l_str and ("pbk=&" in l_str or l_str.endswith("pbk=")):
             logger.warning(f"Пропуск повреждённой Reality ссылки без pbk: {l_str[:50]}...")
             continue
+
+        # Моментальное исключение конфигураций серверов с is_active = 0
+        srv_disabled = False
+        for s_row in (inactive_srvs or []):
+            try:
+                s_name = s_row[0]
+                s_host = s_row[1]
+            except Exception:
+                s_name = str(s_row)
+                s_host = ""
+            clean_host = (s_host or "").split(":")[0].strip()
+            if clean_host and clean_host in l_str:
+                srv_disabled = True
+                break
+            if s_name and f"#{s_name}" in l_str:
+                srv_disabled = True
+                break
+        if srv_disabled:
+            continue
+
         cleaned_lines.append(l_str)
 
     final_configs = "\n".join(cleaned_lines).strip()
@@ -295,7 +323,8 @@ def build_subscription_payload(sub_id: str, headers: dict = None, query: str = "
 
     resp_headers = {
         "Subscription-Userinfo": f"upload=0; download={traffic_bytes}; total={limit_bytes}; expire={expire_ts}",
-        "Profile-Title": "SVOII VPN VIP",
+        "Profile-Title": f"base64:{base64.b64encode('SVOII VPN'.encode('utf-8')).decode('utf-8')}",
+        "Profile-Update-Interval": "12",
         "Profile-Update-Interval": "12"
     }
 

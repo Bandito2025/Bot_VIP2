@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import sqlite3
 import base64
 import logging
@@ -288,6 +289,42 @@ def build_subscription_payload(sub_id: str, headers: dict = None, query: str = "
             continue
 
         cleaned_lines.append(l_str)
+
+    # Динамическая сборка активных протоколов из server_inbounds и user_key_nodes
+    if k_id:
+        try:
+            with get_db_conn(p) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                node_rows = c.execute("""
+                    SELECT ukn.inbound_id, ukn.panel_type, ukn.remote_id, s.id as server_id, s.name as server_name, s.host
+                    FROM user_key_nodes ukn
+                    JOIN servers s ON s.id = ukn.server_id
+                    WHERE ukn.key_id = ? AND ukn.is_active = 1 AND s.is_active = 1
+                """, (k_id,)).fetchall()
+                for nr in node_rows:
+                    inb_id = nr["inbound_id"]
+                    ptype = nr["panel_type"]
+                    srv_name = nr["server_name"] or "VPN"
+                    srv_host = (nr["host"] or "").split(":")[0] or "127.0.0.1"
+                    if inb_id and ptype == "3xui":
+                        inb_row = c.execute("SELECT * FROM server_inbounds WHERE server_id = ? AND inbound_id = ? AND is_active = 1", (nr["server_id"], inb_id)).fetchone()
+                        if inb_row:
+                            from panel_manager import generate_3xui_link
+                            inb_dict = {
+                                "id": inb_row["inbound_id"],
+                                "protocol": inb_row["protocol"],
+                                "remark": inb_row["remark"],
+                                "port": inb_row["port"],
+                                "streamSettings": inb_row["stream_json"],
+                                "enable": True
+                            }
+                            country_flag = srv_name.split()[0] if srv_name else "🌐"
+                            lk = generate_3xui_link(inb_dict, client_uuid, srv_host, country_flag, server_name=srv_name)
+                            if lk and lk not in cleaned_lines:
+                                cleaned_lines.append(lk)
+        except Exception as _e_dyn:
+            logger.debug(f"Dynamic protocol links note: {_e_dyn}")
 
     final_configs = "\n".join(cleaned_lines).strip()
     if not final_configs:

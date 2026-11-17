@@ -52,12 +52,12 @@ def get_existing_groups():
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT group_name FROM tariffs WHERE group_name IS NOT NULL AND group_name != ''")
+        cur.execute("SELECT DISTINCT group_name FROM tariffs WHERE group_name IS NOT NULL AND group_name != '' UNION SELECT DISTINCT group_name FROM servers WHERE group_name IS NOT NULL AND group_name != ''")
         groups = [r[0] for r in cur.fetchall()]
         conn.close()
-        return groups if groups else ["Стандарт", "Акции"]
+        return groups if groups else ["Основная", "Стандарт", "VIP"]
     except Exception:
-        return ["Стандарт", "Акции"]
+        return ["Основная", "Стандарт", "VIP"]
 
 async def start_tariff_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_user_admin(update.effective_user.id):
@@ -238,6 +238,15 @@ async def handle_tariff_text_input(update: Update, context: ContextTypes.DEFAULT
         await render_confirm(update.message, wiz, is_edit=False)
         return True
 
+    elif step == "input_custom_group":
+        new_g = raw_text.strip()
+        if new_g:
+            wiz["group"] = new_g
+        wiz["step"] = "confirm"
+        ACTIVE_TARIFF_WIZ[uid] = wiz
+        await render_confirm(update.message, wiz, is_edit=False)
+        return True
+
     return False
 
 async def render_confirm(target, wiz, is_edit=False):
@@ -255,11 +264,12 @@ async def render_confirm(target, wiz, is_edit=False):
     groups = get_existing_groups()
     grp_btns = [
         InlineKeyboardButton(f"{'🟢' if g == grp else '⚪️'} {g}", callback_data=f"tariff_wiz_grp_{g}")
-        for g in groups[:3]
+        for g in groups[:4]
     ]
     rows = []
     if grp_btns:
         rows.append(grp_btns)
+    rows.append([InlineKeyboardButton("➕ Новая группа", callback_data="tariff_wiz_new_grp")])
     rows.append([InlineKeyboardButton("✅ Сохранить", callback_data="tariff_wiz_save")])
     rows.append([InlineKeyboardButton("❌ Отмена", callback_data="tariff_wiz_cancel")])
     kb = InlineKeyboardMarkup(rows)
@@ -289,6 +299,22 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
             pass
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К тарифам", callback_data="admin_tariffs_list")]])
         await query.edit_message_text("❌ Создание тарифа отменено.", reply_markup=kb)
+        return True
+
+    if data == "tariff_wiz_new_grp":
+        wiz = ACTIVE_TARIFF_WIZ.get(uid) or context.user_data.get("tariff_wiz")
+        if wiz:
+            wiz["step"] = "input_custom_group"
+            ACTIVE_TARIFF_WIZ[uid] = wiz
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            await query.edit_message_text(
+                "🏷 <b>Введите название новой группы для тарифа:</b>\n<i>(например: Премиум, VIP, Быстрый)</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="tariff_wiz_cancel")]])
+            )
         return True
 
     if data.startswith("tariff_wiz_grp_"):

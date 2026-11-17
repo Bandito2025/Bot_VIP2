@@ -1,7 +1,14 @@
 ﻿.env
+.env.*
+*.bak
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.zip
+*.enc
+backups/
+.update_notify.json
 bot_data.db*
 *.log
 bot.log
@@ -11,12 +18,9 @@ venv/
 __pycache__/
 *.pyc
 backup/
-backups/
 *.tar.gz
-*.zip
 .idea/
 .vscode/
-*.bak
 *.save
 update_*.tar.gz
 bot.tar.gz

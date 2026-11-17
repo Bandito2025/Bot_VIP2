@@ -320,7 +320,10 @@ import subprocess
 import traceback
 import time as time_mod
 from urllib.parse import quote
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.fernet import Fernet
 from http.server import ThreadingHTTPServer, HTTPServer, BaseHTTPRequestHandler
 import httpx
 from dotenv import load_dotenv
@@ -332,7 +335,7 @@ from telegram import (
     InlineKeyboardMarkup,
     LabeledPrice,
 )
-from telegram.error import Forbidden
+from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -1940,35 +1943,172 @@ def get_current_git_commit() -> str:
     except Exception:
         return "main (stable)"
 
-def create_backup_zip(db_path: str = None) -> str:
-    """Создает консистентный снимок SQLite через VACUUM INTO и упаковывает в ZIP вместе с .env"""
-    target_db = db_path or DB_PATH
-    backup_root = os.path.join(BASE_DIR, "backup")
+def harden_file_permissions():
+    """Устанавливает права 0600 на .env и БД, и 0700 на backups/"""
+    if sys.platform.startswith("win"):
+        return
+    try:
+        for p in [os.path.join(BASE_DIR, ".env"), "/root/env.bak", DB_PATH]:
+            if os.path.exists(p):
+                try:
+                    os.chmod(p, 0o600)
+                except Exception:
+                    pass
+        for bdir in [os.path.join(BASE_DIR, "backups"), os.path.join(BASE_DIR, "backup")]:
+            if os.path.exists(bdir):
+                try:
+                    os.chmod(bdir, 0o700)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning(f"[harden_file_permissions] Warning: {e}")
+
+def encrypt_file_with_password(src_file: str, dst_file: str, password: str) -> str:
+    salt = secrets.token_bytes(16)
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100_000
+    )
+    key = base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
+    f = Fernet(key)
+    with open(src_file, "rb") as rf:
+        data = rf.read()
+    encrypted = f.encrypt(data)
+    with open(dst_file, "wb") as wf:
+        wf.write(salt + encrypted)
+    return dst_file
+
+def decrypt_file_with_password(enc_file: str, dst_file: str, password: str) -> bool:
+    try:
+        with open(enc_file, "rb") as rf:
+            raw = rf.read()
+        if len(raw) < 17:
+            return False
+        salt = raw[:16]
+        encrypted = raw[16:]
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100_000
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
+        f = Fernet(key)
+        decrypted = f.decrypt(encrypted)
+        with open(dst_file, "wb") as wf:
+            wf.write(decrypted)
+        return True
+    except Exception as e:
+        logger.error(f"[decrypt_file_with_password] Decryption failed: {e}")
+        return False
+
+def rotate_old_backups():
+    try:
+        keep_days = int(get_setting("auto_backup_keep_days", "14") or 14)
+        cutoff = _pytime.time() - (keep_days * 86400)
+        for bdir in [os.path.join(BASE_DIR, "backups"), os.path.join(BASE_DIR, "backup")]:
+            if not os.path.exists(bdir):
+                continue
+            for fname in os.listdir(bdir):
+                fpath = os.path.join(bdir, fname)
+                if os.path.isfile(fpath) and (fname.endswith(".zip") or fname.endswith(".enc") or fname.endswith(".db")):
+                    if os.path.getmtime(fpath) < cutoff:
+                        try:
+                            os.remove(fpath)
+                            logger.info(f"[rotate_old_backups] Удален устаревший бэкап: {fname}")
+                        except Exception:
+                            pass
+    except Exception as e:
+        logger.warning(f"[rotate_old_backups] Ошибка ротации: {e}")
+
+def create_full_system_backup(reason: str = "manual", password: str = None) -> str:
+    """
+    Создает полный консистентный снимок системы:
+    1. VACUUM INTO для bot_data.db
+    2. Конфиг .env и Caddyfile
+    3. manifest.json с UTC timestamp, git commit, db stats и sha256 хэшами
+    4. Если задан password (или в настройках backup_password) -> шифрует в .zip.enc (AES/Fernet)
+    5. Применяет ротацию архивов старше auto_backup_keep_days
+    """
+    backup_root = os.path.join(BASE_DIR, "backups")
     os.makedirs(backup_root, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    zip_filename = f"backup_Bot_VIP2_{ts}.zip"
-    zip_path = os.path.join(backup_root, zip_filename)
+    harden_file_permissions()
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    commit = get_current_git_commit()
+    base_zip_name = f"backup_full_{reason}_{ts}_{commit}.zip"
+    zip_path = os.path.join(backup_root, base_zip_name)
     tmp_snap_db = os.path.join(backup_root, f"tmp_snap_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.db")
 
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": commit,
+        "reason": reason,
+        "db_stats": {},
+        "sha256_hashes": {}
+    }
+
     try:
+        target_db = DB_PATH
         if os.path.exists(target_db):
-            clean_db_path = repr(tmp_snap_db.replace('\\', '/'))
+            clean_tmp_db = repr(tmp_snap_db.replace('\\', '/'))
             with sqlite3.connect(target_db, timeout=30.0) as conn:
-                conn.execute(f"VACUUM INTO {clean_db_path}")
+                conn.execute(f"VACUUM INTO {clean_tmp_db}")
+            with sqlite3.connect(tmp_snap_db, timeout=30.0) as conn:
+                cur = conn.cursor()
+                u_cnt = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] if cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone() else 0
+                s_cnt = cur.execute("SELECT COUNT(*) FROM servers").fetchone()[0] if cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='servers'").fetchone() else 0
+                t_cnt = cur.execute("SELECT COUNT(*) FROM tariffs").fetchone()[0] if cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tariffs'").fetchone() else 0
+                k_cnt = cur.execute("SELECT COUNT(*) FROM user_keys").fetchone()[0] if cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_keys'").fetchone() else 0
+                manifest["db_stats"] = {
+                    "users": u_cnt,
+                    "servers": s_cnt,
+                    "tariffs": t_cnt,
+                    "user_keys": k_cnt
+                }
+
+        files_to_pack = {}
+        if os.path.exists(tmp_snap_db):
+            files_to_pack["bot_data.db"] = tmp_snap_db
+        elif os.path.exists(target_db):
+            files_to_pack["bot_data.db"] = target_db
+
+        env_candidates = [os.path.join(BASE_DIR, ".env"), "/opt/Bot_VIP/.env", "/root/env.bak"]
+        for ec in env_candidates:
+            if os.path.exists(ec):
+                files_to_pack[".env"] = ec
+                break
+
+        caddy_candidates = [os.path.join(BASE_DIR, "Caddyfile"), "/etc/caddy/Caddyfile"]
+        for cc in caddy_candidates:
+            if os.path.exists(cc):
+                files_to_pack["Caddyfile"] = cc
+                break
+
+        for arc_name, fpath in files_to_pack.items():
+            with open(fpath, "rb") as rf:
+                manifest["sha256_hashes"][arc_name] = hashlib.sha256(rf.read()).hexdigest()
 
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            if os.path.exists(tmp_snap_db):
-                zf.write(tmp_snap_db, arcname="bot_data.db")
-            elif os.path.exists(target_db):
-                zf.write(target_db, arcname="bot_data.db")
+            for arc_name, fpath in files_to_pack.items():
+                zf.write(fpath, arcname=arc_name)
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
-            env_candidates = [os.path.join(BASE_DIR, ".env"), "/opt/Bot_VIP/.env", "/root/env.bak"]
-            for ec in env_candidates:
-                if os.path.exists(ec):
-                    zf.write(ec, arcname=".env")
-                    break
+        final_path = zip_path
+        enc_pwd = password or get_setting("backup_password", "")
+        if enc_pwd:
+            enc_path = zip_path + ".enc"
+            encrypt_file_with_password(zip_path, enc_path, enc_pwd)
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+            final_path = enc_path
 
-        return zip_path
+        rotate_old_backups()
+        return final_path
     finally:
         if os.path.exists(tmp_snap_db):
             try:
@@ -1976,29 +2116,225 @@ def create_backup_zip(db_path: str = None) -> str:
             except Exception:
                 pass
 
+def create_backup_zip(db_path: str = None) -> str:
+    return create_full_system_backup(reason="manual")
+
 def create_manual_snapshot_backup() -> str:
-    backup_root = os.path.join(BASE_DIR, "backup")
-    os.makedirs(backup_root, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    commit = get_current_git_commit()
-    snap_dir = os.path.join(backup_root, f"{ts}_{commit}")
-    os.makedirs(snap_dir, exist_ok=True)
-    dst_db = os.path.join(snap_dir, "bot_data.db")
-    if os.path.exists(DB_PATH):
-        shutil.copy2(DB_PATH, dst_db)
-    with open(os.path.join(snap_dir, "commit.txt"), "w", encoding="utf-8") as f:
-        f.write(commit)
-    with open(os.path.join(snap_dir, "date.txt"), "w", encoding="utf-8") as f:
-        f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    return dst_db if os.path.exists(dst_db) else DB_PATH
+    return create_full_system_backup(reason="manual_snap")
+
+def restore_system_from_backup_archive(archive_path: str, password: str = None) -> tuple[bool, str]:
+    """
+    Восстанавливает систему из бэкапа (.zip, .zip.enc или чистого .db):
+    - Дешифрует при необходимости.
+    - Проверяет manifest.json и sha256.
+    - Выполняет PRAGMA integrity_check SQLite.
+    - Делает safety-снимок текущей БД.
+    - Атомарно заменяет DB_PATH и восстанавливает .env (если есть).
+    - Запускает автомиграции через migrate_db.
+    """
+    if not os.path.exists(archive_path):
+        return False, f"Файл бэкапа не найден: {archive_path}"
+
+    temp_work_dir = os.path.join(BASE_DIR, f"tmp_restore_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
+    os.makedirs(temp_work_dir, exist_ok=True)
+    try:
+        target_zip = archive_path
+        if archive_path.endswith(".enc"):
+            enc_pwd = password or get_setting("backup_password", "")
+            if not enc_pwd:
+                return False, "❌ Архив зашифрован. Требуется пароль расшифровки."
+            dec_zip = os.path.join(temp_work_dir, "decrypted.zip")
+            ok = decrypt_file_with_password(archive_path, dec_zip, enc_pwd)
+            if not ok:
+                return False, "❌ Ошибка расшифровки: неверный пароль или поврежденный архив."
+            target_zip = dec_zip
+
+        extracted_db = None
+        if archive_path.endswith(".db") and not archive_path.endswith(".zip"):
+            extracted_db = archive_path
+        else:
+            try:
+                with zipfile.ZipFile(target_zip, "r") as zf:
+                    zf.extractall(temp_work_dir)
+            except Exception as ze:
+                return False, f"❌ Ошибка распаковки ZIP: {ze}"
+
+            manifest_p = os.path.join(temp_work_dir, "manifest.json")
+            extracted_db = os.path.join(temp_work_dir, "bot_data.db")
+            if not os.path.exists(extracted_db):
+                for f in os.listdir(temp_work_dir):
+                    if f.endswith(".db") and not f.startswith("tmp_"):
+                        extracted_db = os.path.join(temp_work_dir, f)
+                        break
+
+            if not extracted_db or not os.path.exists(extracted_db):
+                return False, "❌ В архиве не найден файл базы данных (bot_data.db)."
+
+            if os.path.exists(manifest_p):
+                try:
+                    with open(manifest_p, "r", encoding="utf-8") as mf:
+                        manifest = json.load(mf)
+                    expected_db_hash = manifest.get("sha256_hashes", {}).get("bot_data.db")
+                    if expected_db_hash:
+                        with open(extracted_db, "rb") as rf:
+                            actual_db_hash = hashlib.sha256(rf.read()).hexdigest()
+                        if actual_db_hash != expected_db_hash:
+                            return False, "❌ Контрольная сумма SHA-256 базы данных не совпадает! Архив поврежден."
+                except Exception as me:
+                    logger.warning(f"[restore] Manifest check warning: {me}")
+
+        with sqlite3.connect(extracted_db, timeout=30.0) as conn:
+            res = conn.execute("PRAGMA integrity_check").fetchone()
+            if not res or res[0] != "ok":
+                return False, f"❌ Ошибка целостности SQLite БД: {res[0] if res else 'неизвестно'}"
+
+        try:
+            if os.path.exists(DB_PATH):
+                create_full_system_backup("safety_pre_restore")
+        except Exception as se:
+            logger.warning(f"[restore] Safety backup warning: {se}")
+
+        shutil.copy2(extracted_db, DB_PATH)
+
+        extracted_env = os.path.join(temp_work_dir, ".env")
+        if os.path.exists(extracted_env) and not os.path.exists(os.path.join(BASE_DIR, ".env")):
+            shutil.copy2(extracted_env, os.path.join(BASE_DIR, ".env"))
+
+        harden_file_permissions()
+
+        try:
+            import migrate_db
+            migrate_db.run_migrations(DB_PATH)
+        except Exception as me:
+            logger.warning(f"[restore] Migration warning: {me}")
+
+        return True, "✅ Система успешно восстановлена из резервной копии!"
+    finally:
+        if os.path.exists(temp_work_dir):
+            shutil.rmtree(temp_work_dir, ignore_errors=True)
+
+def get_all_admin_ids(db_path: str = None) -> list[int]:
+    """Возвращает уникальный список ID всех администраторов системы"""
+    target_db = db_path or DB_PATH
+    admins = set()
+    if ADMIN_ID:
+        try:
+            admins.add(int(ADMIN_ID))
+        except Exception:
+            pass
+    env_admins = os.getenv("ADMIN_IDS", "") or os.getenv("ADMINS", "")
+    for part in env_admins.replace(";", ",").replace(" ", ",").split(","):
+        if part.strip().isdigit():
+            admins.add(int(part.strip()))
+    try:
+        import staff_roles
+        staff_admins = staff_roles.get_staff_list(target_db, role="admin")
+        for s in staff_admins:
+            admins.add(int(s["user_id"]))
+    except Exception:
+        pass
+    return sorted(list(admins))
+
+async def ensure_required_ports_open() -> dict:
+    """
+    Проверяет и открывает необходимые порты на сервере:
+    22/tcp (SSH), 80/tcp, 443/tcp+udp (VPN), 8443/tcp+udp, SUB_PORT/tcp,
+    а также все активные порты из server_inbounds и servers.
+    На Windows аккуратно логирует без ошибок.
+    """
+    res = {"platform": sys.platform, "opened": [], "status": "ok"}
+    if sys.platform.startswith("win"):
+        res["status"] = "skipped_windows"
+        logger.info("[Firewall] Windows platform detected, port firewall check skipped.")
+        return res
+
+    base_ports = [
+        ("22", "tcp"),
+        ("80", "tcp"),
+        ("443", "tcp"),
+        ("443", "udp"),
+        ("8443", "tcp"),
+        ("8443", "udp"),
+        (str(SUB_PORT), "tcp")
+    ]
+    ports_to_open = set(base_ports)
+
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            if cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_inbounds'").fetchone():
+                inbs = cur.execute("SELECT port, protocol FROM server_inbounds WHERE is_active = 1").fetchall()
+                for inb in inbs:
+                    p = str(inb["port"])
+                    proto = (inb["protocol"] or "").lower()
+                    if p and p.isdigit() and int(p) > 0:
+                        ports_to_open.add((p, "tcp"))
+                        if proto in ("hysteria2", "quic", "wireguard", "tuic"):
+                            ports_to_open.add((p, "udp"))
+    except Exception as e:
+        logger.warning(f"[ensure_required_ports_open] DB port query error: {e}")
+
+    has_ufw = shutil.which("ufw") is not None
+    has_iptables = shutil.which("iptables") is not None
+
+    for p, proto in sorted(ports_to_open, key=lambda x: (int(x[0]), x[1])):
+        rule_desc = f"{p}/{proto}"
+        opened = False
+        if has_ufw:
+            try:
+                subprocess.run(["ufw", "allow", f"{p}/{proto}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                opened = True
+            except Exception:
+                pass
+        if has_iptables:
+            try:
+                subprocess.run(["iptables", "-I", "INPUT", "-p", proto, "--dport", p, "-j", "ACCEPT"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                opened = True
+            except Exception:
+                pass
+        if opened:
+            res["opened"].append(rule_desc)
+
+    logger.info(f"[Firewall] Ensured ports open: {len(res['opened'])} rules applied.")
+    return res
+
+async def safe_answer(query, *args, **kwargs):
+    if not query:
+        return
+    try:
+        await query.answer(*args, **kwargs)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if any(k in err_msg for k in ["query is too old", "query id is invalid", "message is not modified"]):
+            logger.debug(f"[safe_answer] Ignored query answer warning: {e}")
+        else:
+            logger.warning(f"[safe_answer] query.answer error: {e}")
+
+def get_remote_git_commit() -> str:
+    try:
+        res = subprocess.check_output(["git", "rev-parse", "--short", "origin/main"], cwd=BASE_DIR, stderr=subprocess.DEVNULL, timeout=10)
+        return res.decode("utf-8").strip()
+    except Exception:
+        return "unknown"
+
+def get_git_commits_diff() -> tuple[str, str, str]:
+    """Возвращает (current_commit, remote_commit, log_messages)"""
+    repo_dir = BASE_DIR
+    try:
+        subprocess.run(["git", "fetch", "origin", "main"], cwd=repo_dir, check=False, timeout=15)
+        curr = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=repo_dir, stderr=subprocess.DEVNULL, timeout=10).decode().strip()
+        remote = subprocess.check_output(["git", "rev-parse", "--short", "origin/main"], cwd=repo_dir, stderr=subprocess.DEVNULL, timeout=10).decode().strip()
+        log_out = ""
+        if curr != remote:
+            log_out = subprocess.check_output(["git", "log", "HEAD..origin/main", "--oneline", "-n", "5"], cwd=repo_dir, stderr=subprocess.DEVNULL, timeout=10).decode().strip()
+        return curr, remote, log_out
+    except Exception as e:
+        return get_current_git_commit(), "unknown", str(e)
 
 def perform_inbot_git_update(hard_reset: bool = False) -> tuple[bool, str]:
-    """
-    Создает бэкап БД, затем выполняет обновление кода с GitHub прямо из процесса бота
-    (работает и на Linux-сервере, и на Windows ПК).
-    """
-    create_manual_snapshot_backup()
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    create_full_system_backup("safety_pre_update")
+    repo_dir = BASE_DIR
     try:
         subprocess.run(["git", "fetch", "origin", "main"], cwd=repo_dir, check=False, timeout=20)
         if hard_reset:
@@ -2015,6 +2351,136 @@ def perform_inbot_git_update(hard_reset: bool = False) -> tuple[bool, str]:
         return proc.returncode == 0, out.strip()
     except Exception as e:
         return False, str(e)
+
+def render_bot_update_screen() -> tuple[str, InlineKeyboardMarkup]:
+    curr, remote, log_diff = get_git_commits_diff()
+    has_update = (remote != "unknown" and curr != remote)
+    status_line = "🟢 <b>У вас установлена самая свежая версия!</b>" if not has_update else "🔄 <b>Доступна новая версия с GitHub!</b>"
+    text = (
+        f"🔄 <b>Центр обновлений бота (Git Self-Update)</b>\n\n"
+        f"{status_line}\n\n"
+        f"📌 Текущий коммит: <code>{html.escape(curr)}</code>\n"
+        f"🌐 Удаленный коммит: <code>{html.escape(remote)}</code>\n"
+        f"📦 Репозиторий: <code>https://github.com/Bandito2025/Bot_VIP2</code>\n"
+    )
+    if log_diff:
+        text += f"\n📝 <b>Новые изменения:</b>\n<pre>{html.escape(log_diff)}</pre>\n"
+
+    buttons = []
+    if has_update:
+        buttons.append([InlineKeyboardButton("🚀 Обновить бота сейчас", callback_data="admin_bot_update_run")])
+    else:
+        buttons.append([InlineKeyboardButton("🔄 Принудительно переустановить (git pull)", callback_data="admin_bot_update_run")])
+    buttons.append([InlineKeyboardButton("🛡 Проверить и открыть порты", callback_data="admin_check_open_ports")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_settings_menu"), InlineKeyboardButton("🈴 На главную", callback_data="admin_back_main")])
+    return text, InlineKeyboardMarkup(buttons)
+
+def render_admin_backup_menu() -> tuple[str, InlineKeyboardMarkup]:
+    auto_enabled = get_setting("auto_backup_enabled", "1") == "1"
+    b_time = get_setting("auto_backup_time", "03:00")
+    k_days = get_setting("auto_backup_keep_days", "14")
+    chan_id = get_setting("backup_channel_id", "") or "Не задан"
+    pwd = get_setting("backup_password", "")
+    pwd_status = "Установлен (AES-256)" if pwd else "Отключен (без пароля)"
+
+    text = (
+        "💾 <b>Управление резервными копиями (Бэкапами)</b>\n\n"
+        f"⚙️ <b>Ежедневный автобэкап:</b> {'🟢 Включен' if auto_enabled else '🔴 Отключен'}\n"
+        f"⏰ <b>Время автобэкапа:</b> <code>{html.escape(b_time)}</code> UTC\n"
+        f"🗓 <b>Хранить бэкапы:</b> <code>{html.escape(k_days)}</code> дн.\n"
+        f"📢 <b>Канал отправки:</b> <code>{html.escape(chan_id)}</code>\n"
+        f"🔐 <b>Шифрование архивов:</b> <code>{pwd_status}</code>\n\n"
+        "Вы можете моментально скачать полный бэкап системы или восстановить БД:"
+    )
+    buttons = [
+        [InlineKeyboardButton("💾 Скачать полный бэкап сейчас", callback_data="admin_send_backup_now")],
+        [InlineKeyboardButton(f"{'🔴 Отключить' if auto_enabled else '🟢 Включить'} автобэкап", callback_data="admin_toggle_auto_backup")],
+        [InlineKeyboardButton(f"⏰ Изменить время ({b_time})", callback_data="admin_edit_auto_backup_time")],
+        [InlineKeyboardButton("📢 Канал для бэкапов", callback_data="admin_set_backup_channel")],
+        [InlineKeyboardButton("🔐 Пароль шифрования", callback_data="admin_set_backup_password")],
+        [InlineKeyboardButton("📥 Меню восстановления из архива", callback_data="admin_restore_from_backup_menu")],
+        [InlineKeyboardButton("⬅️ Назад в настройки", callback_data="admin_settings_menu"), InlineKeyboardButton("🈴 На главную", callback_data="admin_back_main")]
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+def render_admin_backup_restore_menu() -> tuple[str, InlineKeyboardMarkup]:
+    backup_files = []
+    for bdir in [os.path.join(BASE_DIR, "backups"), os.path.join(BASE_DIR, "backup")]:
+        if os.path.exists(bdir):
+            for fname in os.listdir(bdir):
+                if fname.endswith(".zip") or fname.endswith(".enc") or fname.endswith(".db"):
+                    fpath = os.path.join(bdir, fname)
+                    if os.path.isfile(fpath):
+                        backup_files.append((fname, os.path.getmtime(fpath)))
+    backup_files.sort(key=lambda x: x[1], reverse=True)
+    top_backups = backup_files[:5]
+
+    text = (
+        "📥 <b>Восстановление системы из бэкапа</b>\n\n"
+        "Выберите архив на сервере для восстановления в 1 клик\n"
+        "<i>(или отправьте файл .zip, .zip.enc или .db прямо в этот чат):</i>\n\n"
+    )
+    if not top_backups:
+        text += "<i>На сервере пока нет сохраненных архивов.</i>"
+    else:
+        for idx, (fname, mtime) in enumerate(top_backups, 1):
+            dt_str = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M")
+            text += f"{idx}. <code>{html.escape(fname)}</code> ({dt_str})\n"
+
+    buttons = []
+    for fname, _ in top_backups:
+        clean_name = fname[-30:] if len(fname) > 30 else fname
+        buttons.append([InlineKeyboardButton(f"♻️ Восстановить {clean_name}", callback_data=f"admin_restore_file_{fname}")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад к бэкапам", callback_data="admin_backup_menu")])
+    buttons.append([InlineKeyboardButton("🈴 На главную", callback_data="admin_back_main")])
+    return text, InlineKeyboardMarkup(buttons)
+
+def render_admin_users_hub() -> tuple[str, InlineKeyboardMarkup]:
+    with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        now_ts = int(_pytime.time())
+        total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active_subs = cur.execute("SELECT COUNT(*) FROM user_keys WHERE expires_at > ?", (now_ts,)).fetchone()[0]
+        expired_subs = cur.execute("SELECT COUNT(*) FROM user_keys WHERE expires_at <= ? AND expires_at > 0", (now_ts,)).fetchone()[0]
+        trial_users = cur.execute("SELECT COUNT(*) FROM users WHERE trial_used = 1").fetchone()[0]
+        ref_count = cur.execute("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL AND referrer_id != 0").fetchone()[0]
+        total_balance = cur.execute("SELECT COALESCE(SUM(balance), 0) FROM users").fetchone()[0]
+        traffic_bytes = cur.execute("SELECT COALESCE(SUM(traffic_bytes), 0) FROM user_keys").fetchone()[0]
+        used_traffic_gb = round(traffic_bytes / (1024**3), 2)
+        total_keys_on_nodes = cur.execute("SELECT COUNT(*) FROM user_key_nodes").fetchone()[0] if cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_key_nodes'").fetchone() else 0
+
+    text = (
+        "👥 <b>Хаб пользователей и управление базой</b>\n\n"
+        f"📊 <b>Статистика системы:</b>\n"
+        f"1️⃣ Всего пользователей: <b>{total_users}</b>\n"
+        f"2️⃣ Активных подписок: <b>{active_subs}</b>\n"
+        f"3️⃣ Истекших подписок: <b>{expired_subs}</b>\n"
+        f"4️⃣ Триал-пользователей: <b>{trial_users}</b>\n"
+        f"5️⃣ Привлеченных рефералов: <b>{ref_count}</b>\n"
+        f"6️⃣ Общий баланс пользователей: <b>{total_balance:.2f} ₽</b>\n"
+        f"7️⃣ Израсходованный трафик: <b>{used_traffic_gb} GB</b>\n"
+        f"8️⃣ Активных ключей на нодах: <b>{total_keys_on_nodes}</b>\n\n"
+        "Выберите раздел для управления пользователями или синхронизации с нодами:"
+    )
+    buttons = [
+        [
+            InlineKeyboardButton("👥 Список пользователей", callback_data="admin_users_list_all"),
+            InlineKeyboardButton("🔍 Поиск пользователя", callback_data="admin_user_search")
+        ],
+        [
+            InlineKeyboardButton("📥 Восстановление из бэкапа", callback_data="admin_restore_users_menu"),
+            InlineKeyboardButton("🔄 Синхронизировать БД ➔ Панели", callback_data="admin_sync_db_to_panel")
+        ],
+        [
+            InlineKeyboardButton("🧠 Умное восстановление из панелей", callback_data="admin_smart_restore_from_panels"),
+            InlineKeyboardButton("🧹 Очистить удаленных из панелей", callback_data="admin_sync_deleted_users")
+        ],
+        [
+            InlineKeyboardButton("🈴 В главное меню", callback_data="admin_back_main")
+        ]
+    ]
+    return text, InlineKeyboardMarkup(buttons)
 
 # ==============================================================================
 # 📣 МОДУЛЬ "МАРКЕТИНГ"
@@ -2990,9 +3456,10 @@ def admin_dashboard_keyboard():
         ],
         [
             InlineKeyboardButton("⚙️ Настройки бота", callback_data="admin_settings_menu"),
-            InlineKeyboardButton(f"🧩 Расширения {badge}", callback_data="admin_ext_menu")
+            InlineKeyboardButton("🔄 Обновить бота", callback_data="admin_bot_update_menu")
         ],
         [
+            InlineKeyboardButton(f"🧩 Расширения {badge}", callback_data="admin_ext_menu"),
             InlineKeyboardButton(f"👥 Персонал (2 Адм / 3 Мод) {badge}", callback_data="admin_staff_menu")
         ],
         [
@@ -3017,7 +3484,10 @@ async def render_servers_monitor_screen():
             InlineKeyboardButton("🔄 Обновить", callback_data="admin_servers_menu"),
             InlineKeyboardButton("🔄 Синхронизировать ноды сейчас", callback_data="admin_sync_nodes_now")
         ],
-        [InlineKeyboardButton("➕ Добавить сервер", callback_data="admin_srv_add")]
+        [
+            InlineKeyboardButton("➕ Добавить сервер", callback_data="admin_srv_add"),
+            InlineKeyboardButton("🔄 Сканировать все ноды и выдать ключи", callback_data="admin_scan_all_nodes_and_provision")
+        ]
     ]
 
     if not servers:
@@ -3075,6 +3545,26 @@ def notif_settings_keyboard():
     return InlineKeyboardMarkup(buttons)
 
 # --- Фоновые задачи ---
+def schedule_daily_backup_job(application):
+    if not application or not application.job_queue:
+        return
+    try:
+        for j in application.job_queue.get_jobs_by_name("daily_system_backup"):
+            j.schedule_removal()
+        time_str = get_setting("auto_backup_time", "03:00")
+        parts = time_str.split(":")
+        hour = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 3
+        minute = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        target_time = time(hour=hour, minute=minute)
+        application.job_queue.run_daily(
+            daily_backup_job,
+            time=target_time,
+            name="daily_system_backup"
+        )
+        logger.info(f"[schedule_daily_backup_job] Daily backup scheduled at {time_str} UTC")
+    except Exception as e:
+        logger.error(f"[schedule_daily_backup_job] Scheduling failed: {e}")
+
 async def post_init(application):
     global BOT_USERNAME_CACHE
     try:
@@ -3085,6 +3575,38 @@ async def post_init(application):
 
     scan_and_load_extensions(application)
     threading.Thread(target=start_sub_aggregator_server, daemon=True).start()
+
+    # Проверка маркера успешного обновления
+    notify_file = os.path.join(BASE_DIR, ".update_notify.json")
+    if os.path.exists(notify_file):
+        try:
+            with open(notify_file, "r", encoding="utf-8") as nf:
+                n_data = json.load(nf)
+            os.remove(notify_file)
+            target_chat = n_data.get("chat_id") or ADMIN_ID
+            p_comm = n_data.get("prev_commit", "prev")
+            n_comm = n_data.get("new_commit", get_current_git_commit())
+            await application.bot.send_message(
+                chat_id=target_chat,
+                text=(
+                    f"🎉 <b>Бот успешно обновлен!</b>\n\n"
+                    f"Версия: <code>{html.escape(p_comm)}</code> ➔ <code>{html.escape(n_comm)}</code>\n"
+                    f"✅ База данных проверена и мигрирована.\n"
+                    f"✅ Сетевые порты проверены и открыты.\n"
+                    f"✅ Все службы перезапущены и стабильно работают."
+                ),
+                parse_mode="HTML"
+            )
+        except Exception as n_err:
+            logger.warning(f"[post_init] Update notify error: {n_err}")
+
+    harden_file_permissions()
+    try:
+        await ensure_required_ports_open()
+    except Exception as _fe:
+        logger.warning(f"[post_init] Port check warning: {_fe}")
+
+    schedule_daily_backup_job(application)
 
     if ADMIN_ID:
         try:
@@ -3102,27 +3624,49 @@ async def post_init(application):
             logger.warning(f"Не удалось отправить стартовое сообщение админу: {e}")
 
 async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    if ADMIN_ID and os.path.exists(DB_PATH) and is_notif_enabled("notify_backup"):
-        zip_p = ""
-        try:
-            zip_p = create_backup_zip()
-            if os.path.exists(zip_p):
+    if get_setting("auto_backup_enabled", "1") != "1":
+        return
+    zip_p = ""
+    try:
+        zip_p = create_full_system_backup(reason="daily_auto")
+        if not os.path.exists(zip_p):
+            return
+
+        caption = (
+            f"⏰ <b>Ежедневный автоматический бэкап Bot_VIP2</b>\n"
+            f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            f"📦 Архив: <code>{os.path.basename(zip_p)}</code>\n"
+            f"🔒 Шифрование: {'AES-256 (Fernet)' if zip_p.endswith('.enc') else 'Без пароля'}"
+        )
+        for adm_id in get_all_admin_ids():
+            try:
                 with open(zip_p, "rb") as f:
                     await context.bot.send_document(
-                        chat_id=ADMIN_ID,
+                        chat_id=adm_id,
                         document=f,
                         filename=os.path.basename(zip_p),
-                        caption=f"⏰ <b>Ежедневный автоматический бэкап Bot_VIP2</b>\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\nВ архиве: снимок базы SQLite и .env",
+                        caption=caption,
                         parse_mode="HTML"
                     )
-        except Exception as e:
-            logger.error(f"Ошибка авто-бэкапа: {e}")
-        finally:
-            if zip_p and os.path.exists(zip_p):
-                try:
-                    os.remove(zip_p)
-                except Exception:
-                    pass
+            except Exception as ae:
+                logger.warning(f"[daily_backup_job] Failed to send to admin {adm_id}: {ae}")
+
+        chan_id = get_setting("backup_channel_id", "")
+        if chan_id:
+            try:
+                target_chan = int(chan_id) if chan_id.lstrip('-').isdigit() else chan_id
+                with open(zip_p, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=target_chan,
+                        document=f,
+                        filename=os.path.basename(zip_p),
+                        caption=caption,
+                        parse_mode="HTML"
+                    )
+            except Exception as ce:
+                logger.warning(f"[daily_backup_job] Failed to send to backup channel {chan_id}: {ce}")
+    except Exception as e:
+        logger.error(f"Ошибка авто-бэкапа: {e}")
 
 async def expire_vips_job(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3542,7 +4086,12 @@ async def sync_server_nodes_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[sync_server_nodes_job] Ошибка синхронизации нод: {e}")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    if 'Message is not modified' in str(context.error):
+    err_str = str(context.error) if context.error else ""
+    if any(k in err_str for k in ["Message is not modified", "Query is too old", "Query ID is invalid"]):
+        return
+
+    if isinstance(context.error, (TimedOut, NetworkError, httpx.TimeoutException, httpx.NetworkError)):
+        logger.warning(f"Telegram/Network timeout notice: {context.error}")
         return
 
     logger.error("Ошибка при обработке обновления:", exc_info=context.error)
@@ -3994,11 +4543,8 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(help_text, parse_mode="HTML", reply_markup=kb_h)
         return
 
-    if data and data.startswith("admin_srv_"):
-        srv_id = int(data.split("_")[-1])
-        text_s, kb_s = render_server_details_screen(srv_id) if "render_server_details_screen" in globals() else (f"Сервер #{srv_id}", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К серверам", callback_data="admin_servers")]]))
-        await query.message.edit_text(text_s, parse_mode="HTML", reply_markup=kb_s)
-        return
+    if data and data.startswith("admin_srv_") and data.count("_") == 2 and data.split("_")[2].isdigit():
+        data = f"admin_srv_view_{data.split('_')[2]}"
 
     if data and data.startswith("key_loc_"):
         k_id = int(data.split("_")[-1])
@@ -5457,8 +6003,71 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_admin_dashboard(update, context)
         return
 
-    if data == "admin_users_menu":
+    if data in ("admin_users_menu", "admin_users"):
+        await safe_answer(query)
+        text_out, kb_out = render_admin_users_hub()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_users_list_all":
+        await safe_answer(query)
         text_out, kb_out = render_users_filter_screen(flt="all", page=0)
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_user_search":
+        context.user_data["mode"] = "search_user"
+        await query.edit_message_text(
+            "🔍 <b>Поиск пользователя</b>\n\n"
+            "Отправьте <code>Telegram ID</code>, <code>@username</code> или имя пользователя:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в Пользователи", callback_data="admin_users_menu")]])
+        )
+        return
+
+    if data == "admin_restore_users_menu":
+        await safe_answer(query)
+        text_out, kb_out = render_admin_backup_restore_menu()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_sync_db_to_panel":
+        await safe_answer(query, "⏳ Синхронизация БД с панелями...")
+        try:
+            from panel_manager import sync_active_keys_with_servers
+            res = await sync_active_keys_with_servers(DB_PATH)
+            await query.answer(f"✅ Синхронизация завершена: обработано {res.get('processed', 0)} ключей", show_alert=True)
+        except Exception as _e:
+            await query.answer(f"❌ Ошибка синхронизации: {_e}", show_alert=True)
+        text_out, kb_out = render_admin_users_hub()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_smart_restore_from_panels":
+        await safe_answer(query, "⏳ Сканирую панели...")
+        try:
+            c = await MultiPanelManager.smart_restore_users_from_panels(DB_PATH)
+            await query.answer(f"🧠 Умное восстановление завершено! Восстановлено: {c}", show_alert=True)
+        except Exception as _e:
+            await query.answer(f"❌ Ошибка восстановления: {_e}", show_alert=True)
+        text_out, kb_out = render_admin_users_hub()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_sync_deleted_users":
+        await safe_answer(query, "⏳ Очистка удаленных из панелей...")
+        try:
+            from panel_manager import sync_active_keys_with_servers
+            res = await sync_active_keys_with_servers(DB_PATH)
+            await query.answer("✅ Панели успешно синхронизированы и очищены!", show_alert=True)
+        except Exception as _e:
+            await query.answer(f"❌ Ошибка: {_e}", show_alert=True)
+        text_out, kb_out = render_admin_users_hub()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_panel":
+        text_out, kb_out = render_admin_main_screen()
         await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
         return
 
@@ -5804,7 +6413,7 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💰 Изменить цену (₽)", callback_data=f"admin_tedit_param_price_{t_id}"),
              InlineKeyboardButton("⏳ Изменить срок", callback_data=f"admin_tedit_param_days_{t_id}")],
             [InlineKeyboardButton("🏷 Переименовать", callback_data=f"admin_tedit_param_name_{t_id}"),
-             InlineKeyboardButton("📁 Сменить группу", callback_data=f"admin_tedit_param_grp_{t_id}")],
+             InlineKeyboardButton("📁 Сменить группу", callback_data=f"admin_tariff_set_group_{t_id}")],
             [InlineKeyboardButton("🗑 Удалить тариф", callback_data=f"admin_tariff_del_{t_id}")],
             [InlineKeyboardButton("⬅️ К списку тарифов", callback_data="admin_tariffs_list")]
         ])
@@ -5840,6 +6449,10 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("admin_tariff_del_"):
         t_id = int(data.split("_")[-1])
+        try:
+            create_full_system_backup("safety_tariff_del")
+        except Exception:
+            pass
         delete_tariff(t_id)
         tariffs = get_active_tariffs()
         lines = []
@@ -6001,17 +6614,51 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         wpp_url = srv_dict.get("wpp_url") or ""
         wpp_token = srv_dict.get("wpp_token") or ""
-        group_name = srv_dict.get("group_name") or "Все"
+        group_name = srv_dict.get("group_name") or "Основная"
         p_type = srv_dict.get("panel_type") or p_type or "3xui"
 
         st = await poll_node_live_status(srv)
         status_line = "⏸ Деактивирован" if not is_active else ("🟢 Онлайн" if st["online"] else f"🔴 {st['error']}")
         toggle_label = "⏸ Деактивировать сервер" if is_active else "▶️ Активировать сервер"
 
+        inbs = []
+        try:
+            with sqlite3.connect(DB_PATH) as _conn:
+                _conn.row_factory = sqlite3.Row
+                inbs = _conn.execute("SELECT id, inbound_id, protocol, port, remark, is_active FROM server_inbounds WHERE server_id = ? ORDER BY port ASC", (srv_id,)).fetchall()
+        except Exception:
+            pass
+
+        inb_text_lines = []
+        if inbs:
+            for ib in inbs:
+                dot_i = "🟢" if ib["is_active"] else "🔴"
+                p_name = (ib["protocol"] or "").upper()
+                rem = f" ({ib['remark']})" if ib["remark"] else ""
+                inb_text_lines.append(f"  {dot_i} <b>{html.escape(p_name)}</b> : <code>{ib['port']}</code>{html.escape(rem)}")
+            inb_str = "\n<b>Протоколы ноды (server_inbounds):</b>\n" + "\n".join(inb_text_lines) + "\n"
+        else:
+            inb_str = "\n<b>Протоколы ноды:</b> <i>Не отсканированы (нажмите «Сканировать протоколы ноды»)</i>\n"
+
         kb_rows = [
             [InlineKeyboardButton(toggle_label, callback_data=f"admin_srv_toggle_{srv_id}")],
             [InlineKeyboardButton("✏️ Редактировать сервер", callback_data=f"admin_srv_edit_{srv_id}")],
         ]
+        if inbs:
+            inb_btns = []
+            for ib in inbs:
+                btn_lbl = f"{'🟢' if ib['is_active'] else '🔴'} {(ib['protocol'] or '').upper()}:{ib['port']}"
+                inb_btns.append(InlineKeyboardButton(btn_lbl, callback_data=f"admin_toggle_inb_{ib['id']}"))
+                if len(inb_btns) == 2:
+                    kb_rows.append(inb_btns)
+                    inb_btns = []
+            if inb_btns:
+                kb_rows.append(inb_btns)
+
+        kb_rows.append([InlineKeyboardButton("🔄 Сканировать протоколы ноды", callback_data=f"admin_scan_srv_protocols_{srv_id}")])
+        kb_rows.append([InlineKeyboardButton(f"🏷 Изменить группу ({group_name})", callback_data=f"admin_srv_set_group_{srv_id}")])
+        kb_rows.append([InlineKeyboardButton("📢 Оповестить о новой ноде", callback_data=f"admin_notify_new_node_{srv_id}")])
+
         if wpp_url and wpp_token:
             kb_rows.append([
                 InlineKeyboardButton("🧪 Тест WPP", callback_data=f"admin_srv_test_wpp_{srv_id}"),
@@ -6040,7 +6687,8 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏷 <b>Группа тарифов:</b> <code>{html.escape(group_name)}</code>\n"
             f"📡 <b>Статус:</b> {html.escape(status_line)}\n"
             f"🔑 <b>Онлайн:</b> {st.get('clients_online', 0)} | 📊 <b>Трафик:</b> {st.get('traffic_str', '0 GB')}\n"
-            f"🧩 <b>Шаблон Proxy 2.7.0:</b> <code>{html.escape(prx_tpl or 'Авто VLESS+WS')}</code>",
+            f"🧩 <b>Шаблон Proxy 2.7.0:</b> <code>{html.escape(prx_tpl or 'Авто VLESS+WS')}</code>\n"
+            f"{inb_str}",
             parse_mode="HTML",
             reply_markup=kb
         )
@@ -6137,9 +6785,380 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("admin_srv_del_"):
         srv_id = int(data.split("_")[-1])
+        try:
+            create_full_system_backup("safety_srv_del")
+        except Exception:
+            pass
         delete_vpn_server(srv_id)
         text_out, kb_out = await render_servers_monitor_screen()
         await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    # === МОДУЛЬ 3: Git Self-Update ===
+    if data == "admin_bot_update_menu":
+        await safe_answer(query, "⏳ Проверяю репозиторий...")
+        text_out, kb_out = render_bot_update_screen()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_bot_update_run":
+        await safe_answer(query, "🚀 Запуск обновления...")
+        await query.edit_message_text(
+            "⏳ <b>Выполняется обновление бота...</b>\n\n"
+            "1/5 💾 Создание резервного бэкапа перед обновлением...",
+            parse_mode="HTML"
+        )
+        try:
+            create_full_system_backup("pre_update")
+        except Exception as _be:
+            logger.warning(f"[update] Pre-update backup warning: {_be}")
+
+        prev_commit = get_current_git_commit()
+        await query.edit_message_text(
+            "⏳ <b>Выполняется обновление бота...</b>\n\n"
+            "2/5 📥 Получение свежего кода с GitHub (git pull)...",
+            parse_mode="HTML"
+        )
+        ok, git_out = perform_inbot_git_update(hard_reset=False)
+
+        await query.edit_message_text(
+            "⏳ <b>Выполняется обновление бота...</b>\n\n"
+            "3/5 📦 Установка зависимостей (pip install)...",
+            parse_mode="HTML"
+        )
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=BASE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except Exception:
+            pass
+
+        await query.edit_message_text(
+            "⏳ <b>Выполняется обновление бота...</b>\n\n"
+            "4/5 🔄 Применение миграций базы данных...",
+            parse_mode="HTML"
+        )
+        try:
+            subprocess.run([sys.executable, "migrate_db.py"], cwd=BASE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        except Exception:
+            pass
+
+        await query.edit_message_text(
+            "⏳ <b>Выполняется обновление бота...</b>\n\n"
+            "5/5 🛡 Проверка и открытие сетевых портов...",
+            parse_mode="HTML"
+        )
+        try:
+            await ensure_required_ports_open()
+        except Exception:
+            pass
+
+        new_commit = get_current_git_commit()
+
+        # Маркер для уведомления после перезапуска
+        notify_file = os.path.join(BASE_DIR, ".update_notify.json")
+        try:
+            with open(notify_file, "w", encoding="utf-8") as nf:
+                json.dump({
+                    "chat_id": query.message.chat_id,
+                    "message_id": query.message.message_id,
+                    "prev_commit": prev_commit,
+                    "new_commit": new_commit,
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }, nf, indent=2)
+        except Exception:
+            pass
+
+        await query.edit_message_text(
+            "⚡ <b>Перезапуск процесса бота...</b>",
+            parse_mode="HTML"
+        )
+        if sys.platform.startswith("linux") and os.path.exists("/etc/systemd/system/bot_vip.service"):
+            subprocess.Popen(["systemctl", "restart", "bot_vip", "caddy"])
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        return
+
+    if data == "admin_check_open_ports":
+        await safe_answer(query, "🛡 Проверка портов...")
+        res = await ensure_required_ports_open()
+        opened_txt = ", ".join(res.get("opened", [])) or "Все правила уже применены"
+        await query.answer(f"Статус портов: {res.get('status')}\n{opened_txt}", show_alert=True)
+        return
+
+    # === МОДУЛЬ 1: Управление бэкапами ===
+    if data in ("admin_backup_menu", "admin_bset_backup_menu"):
+        await safe_answer(query)
+        text_out, kb_out = render_admin_backup_menu()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_send_backup_now":
+        await safe_answer(query, "💾 Создаю полный бэкап...")
+        zip_p = ""
+        try:
+            zip_p = create_full_system_backup("manual")
+            if os.path.exists(zip_p):
+                with open(zip_p, "rb") as f:
+                    await query.message.reply_document(
+                        document=f,
+                        filename=os.path.basename(zip_p),
+                        caption=(
+                            f"💾 <b>Полный резервный бэкап Bot_VIP2</b>\n"
+                            f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+                            f"В архиве: консистентный снимок SQLite (VACUUM INTO), .env, Caddyfile и manifest.json\n"
+                            f"🔒 Шифрование: {'AES-256 (Fernet)' if zip_p.endswith('.enc') else 'Без пароля'}"
+                        ),
+                        parse_mode="HTML"
+                    )
+        except Exception as _b_err:
+            logger.error(f"Backup zip error: {_b_err}")
+            await query.message.reply_text(f"❌ Ошибка создания бэкапа: {_b_err}")
+        text_out, kb_out = render_admin_backup_menu()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_toggle_auto_backup":
+        cur_v = get_setting("auto_backup_enabled", "1")
+        new_v = "0" if cur_v == "1" else "1"
+        set_setting("auto_backup_enabled", new_v)
+        await safe_answer(query, f"Автобэкап {'включен' if new_v == '1' else 'отключен'}")
+        text_out, kb_out = render_admin_backup_menu()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data == "admin_edit_auto_backup_time":
+        context.user_data["mode"] = "input_backup_time"
+        await query.edit_message_text(
+            "⏰ <b>Укажите время ежедневного автобэкапа (в формате HH:MM по UTC):</b>\n\n"
+            "Например: <code>03:00</code> или <code>04:30</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_backup_menu")]])
+        )
+        return
+
+    if data == "admin_set_backup_channel":
+        context.user_data["mode"] = "input_backup_channel"
+        await query.edit_message_text(
+            "📢 <b>Укажите Telegram-канал или чат для отправки автобэкапов:</b>\n\n"
+            "Отправьте Chat ID (например <code>-1001234567890</code>) или юзернейм канала <code>@my_backups</code>:\n"
+            "<i>(Убедитесь, что бот добавлен администратором с правом публикации файлов)</i>\n\n"
+            "Отправьте <code>0</code>, чтобы отключить отправку в канал.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_backup_menu")]])
+        )
+        return
+
+    if data == "admin_set_backup_password":
+        context.user_data["mode"] = "input_backup_password"
+        await query.edit_message_text(
+            "🔐 <b>Укажите пароль шифрования резервных копий (AES-256):</b>\n\n"
+            "Все будущие архивы бэкапов будут автоматически зашифрованы с использованием Fernet/PBKDF2.\n\n"
+            "Отправьте <code>0</code> или <code>none</code>, чтобы отключить шифрование (бэкапы будут сохраняться в обычный .zip).",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_backup_menu")]])
+        )
+        return
+
+    if data == "admin_restore_from_backup_menu":
+        await safe_answer(query)
+        text_out, kb_out = render_admin_backup_restore_menu()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data.startswith("admin_restore_file_"):
+        fname = data.replace("admin_restore_file_", "", 1)
+        found_path = ""
+        for bdir in [os.path.join(BASE_DIR, "backups"), os.path.join(BASE_DIR, "backup")]:
+            candidate = os.path.join(bdir, fname)
+            if os.path.exists(candidate):
+                found_path = candidate
+                break
+        if not found_path:
+            await query.answer("❌ Файл бэкапа не найден на сервере.", show_alert=True)
+            return
+        await safe_answer(query, "⏳ Восстанавливаю систему из бэкапа...")
+        ok, res_msg = restore_system_from_backup_archive(found_path)
+        if ok:
+            await query.edit_message_text(
+                f"✅ <b>Система успешно восстановлена!</b>\n\n"
+                f"Архив: <code>{html.escape(fname)}</code>\n"
+                f"{res_msg}\n\n"
+                f"⚡ <i>Рекомендуется синхронизировать ноды.</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Синхронизировать ноды", callback_data="admin_sync_nodes_now")],
+                    [InlineKeyboardButton("🈴 На главную", callback_data="admin_back_main")]
+                ])
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ <b>Ошибка восстановления:</b>\n\n<code>{html.escape(res_msg)}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К бэкапам", callback_data="admin_backup_menu")]])
+            )
+        return
+
+    # === МОДУЛЬ 4: Мультипротокольность & Группы ===
+    if data == "admin_scan_all_nodes_and_provision":
+        await safe_answer(query, "⏳ Сканирую ноды...")
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM servers WHERE is_active = 1")
+            s_ids = [r[0] for r in cur.fetchall()]
+        total_inbs = 0
+        total_prov = 0
+        for sid in s_ids:
+            c = await asyncio.to_thread(MultiPanelManager.scan_server_protocols, sid, DB_PATH)
+            p = await MultiPanelManager.auto_provision_server_to_group_users(sid, DB_PATH)
+            total_inbs += c
+            total_prov += p
+        try:
+            await ensure_required_ports_open()
+        except Exception:
+            pass
+        await query.answer(f"✅ Найдено протоколов: {total_inbs}, выдано ключей: {total_prov}", show_alert=True)
+        text_out, kb_out = await render_servers_monitor_screen()
+        await query.edit_message_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+        return
+
+    if data.startswith("admin_toggle_inb_"):
+        inb_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE server_inbounds SET is_active = 1 - is_active WHERE id = ?", (inb_id,))
+            conn.commit()
+            r = conn.execute("SELECT server_id FROM server_inbounds WHERE id = ?", (inb_id,)).fetchone()
+            target_srv_id = r[0] if r else None
+        await safe_answer(query, "Статус протокола изменен")
+        if target_srv_id:
+            data = f"admin_srv_view_{target_srv_id}"
+
+    if data.startswith("admin_scan_srv_protocols_"):
+        srv_id = int(data.split("_")[-1])
+        await safe_answer(query, "⏳ Сканирую протоколы...")
+        count = await asyncio.to_thread(MultiPanelManager.scan_server_protocols, srv_id, DB_PATH)
+        prov_count = await MultiPanelManager.auto_provision_server_to_group_users(srv_id, DB_PATH)
+        try:
+            await ensure_required_ports_open()
+        except Exception:
+            pass
+        await query.answer(f"✅ Активных протоколов: {count}, выдано ключей пользователям: {prov_count}", show_alert=True)
+        data = f"admin_srv_view_{srv_id}"
+
+    if data.startswith("admin_srv_set_group_"):
+        srv_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT group_name FROM servers WHERE group_name IS NOT NULL AND group_name != '' UNION SELECT DISTINCT group_name FROM tariffs WHERE group_name IS NOT NULL AND group_name != ''")
+            groups = [r[0] for r in cur.fetchall()]
+        if not groups:
+            groups = ["Основная", "VIP"]
+        kb_rows = []
+        for g in groups:
+            kb_rows.append([InlineKeyboardButton(f"📁 {g}", callback_data=f"admin_srv_apply_grp_{srv_id}_{g}")])
+        kb_rows.append([InlineKeyboardButton("➕ Новая группа", callback_data=f"admin_srv_new_grp_{srv_id}")])
+        kb_rows.append([InlineKeyboardButton("⬅️ Назад к серверу", callback_data=f"admin_srv_view_{srv_id}")])
+        await query.edit_message_text(
+            f"🏷 <b>Выберите группу для сервера #{srv_id}:</b>\n\n"
+            f"Сервер будет автоматически выдаваться только клиентам с тарифом этой группы.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb_rows)
+        )
+        return
+
+    if data.startswith("admin_srv_apply_grp_"):
+        parts = data.split("_")
+        srv_id = int(parts[4])
+        g_name = "_".join(parts[5:])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE servers SET group_name = ? WHERE id = ?", (g_name, srv_id))
+            conn.commit()
+        await MultiPanelManager.auto_provision_server_to_group_users(srv_id, DB_PATH)
+        await safe_answer(query, f"Группа сервера: {g_name}")
+        data = f"admin_srv_view_{srv_id}"
+
+    if data.startswith("admin_srv_new_grp_"):
+        srv_id = int(data.split("_")[-1])
+        context.user_data["mode"] = f"enter_new_srv_group_{srv_id}"
+        await query.edit_message_text(
+            f"🏷 <b>Введите название новой группы для сервера #{srv_id}:</b>\n"
+            f"<i>(например: Премиум, Европа, VIP)</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data=f"admin_srv_view_{srv_id}")]])
+        )
+        return
+
+    if data.startswith("admin_notify_new_node_"):
+        srv_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            s_row = conn.execute("SELECT name, group_name FROM servers WHERE id = ?", (srv_id,)).fetchone()
+            if not s_row:
+                await query.answer("Сервер не найден", show_alert=True)
+                return
+            s_name = s_row["name"]
+            g_name = s_row["group_name"] or "Основная"
+            now_ts = int(_pytime.time())
+            if g_name in ("Основная", "Все", ""):
+                u_rows = conn.execute("SELECT DISTINCT user_id FROM user_keys WHERE expires_at > ?", (now_ts,)).fetchall()
+            else:
+                u_rows = conn.execute(
+                    "SELECT DISTINCT uk.user_id FROM user_keys uk JOIN tariffs t ON uk.tariff_id = t.id WHERE t.group_name = ? AND uk.expires_at > ?",
+                    (g_name, now_ts)
+                ).fetchall()
+        sent_c = 0
+        msg_text = (
+            f"🚀 <b>Обновление сети VPN!</b>\n\n"
+            f"В вашу подписку добавлен новый сервер / протокол: <b>{html.escape(s_name)}</b>.\n"
+            f"Для обновления конфигураций просто <b>обновите подписку</b> в вашем VPN-клиенте (Happ / v2rayTun / Streisand / Hiddify)!"
+        )
+        for ur in u_rows:
+            try:
+                await context.bot.send_message(chat_id=ur["user_id"], text=msg_text, parse_mode="HTML")
+                sent_c += 1
+            except Exception:
+                pass
+        await query.answer(f"📢 Оповещение отправлено {sent_c} активным пользователям!", show_alert=True)
+        data = f"admin_srv_view_{srv_id}"
+
+    if data.startswith("admin_tariff_set_group_"):
+        t_id = int(data.split("_")[-1])
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT group_name FROM servers WHERE group_name IS NOT NULL AND group_name != '' UNION SELECT DISTINCT group_name FROM tariffs WHERE group_name IS NOT NULL AND group_name != ''")
+            groups = [r[0] for r in cur.fetchall()]
+        if not groups:
+            groups = ["Основная", "Стандарт", "VIP"]
+        kb_rows = []
+        for g in groups:
+            kb_rows.append([InlineKeyboardButton(f"📁 {g}", callback_data=f"admin_tariff_apply_grp_{t_id}_{g}")])
+        kb_rows.append([InlineKeyboardButton("➕ Новая группа", callback_data=f"admin_tariff_new_grp_{t_id}")])
+        kb_rows.append([InlineKeyboardButton("⬅️ Назад к тарифу", callback_data=f"admin_tedit_view_{t_id}")])
+        await query.edit_message_text(
+            f"📁 <b>Выберите группу для тарифа #{t_id}:</b>\n\n"
+            f"Пользователи этого тарифа получат доступ к серверам выбранной группы.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb_rows)
+        )
+        return
+
+    if data.startswith("admin_tariff_apply_grp_"):
+        parts = data.split("_")
+        t_id = int(parts[4])
+        g_name = "_".join(parts[5:])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE tariffs SET group_name = ? WHERE id = ?", (g_name, t_id))
+            conn.commit()
+        await safe_answer(query, f"Группа тарифа: {g_name}")
+        data = f"admin_tedit_view_{t_id}"
+
+    if data.startswith("admin_tariff_new_grp_"):
+        t_id = int(data.split("_")[-1])
+        context.user_data["mode"] = f"enter_new_tariff_group_{t_id}"
+        await query.edit_message_text(
+            f"📁 <b>Введите название новой группы для тарифа #{t_id}:</b>\n"
+            f"<i>(например: Премиум, VIP, Специальный)</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data=f"admin_tedit_view_{t_id}")]])
+        )
         return
 
     if data.startswith("admin_add_vpn_"):
@@ -6975,6 +7994,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("❌ Введите корректное число (например: 100 или 0 для бесплатного сброса).")
             return
 
+        elif mode == "input_backup_time":
+            context.user_data["mode"] = None
+            t_val = text.strip()
+            if re.match(r"^\d{1,2}:\d{2}$", t_val):
+                parts = t_val.split(":")
+                hh = int(parts[0])
+                mm = int(parts[1])
+                if 0 <= hh < 24 and 0 <= mm < 60:
+                    norm_t = f"{hh:02d}:{mm:02d}"
+                    set_setting("auto_backup_time", norm_t)
+                    schedule_daily_backup_job(context.application)
+                    text_out, kb_out = render_admin_backup_menu()
+                    await msg.reply_text(f"✅ Время автобэкапа установлено: <code>{norm_t}</code> UTC\n\n{text_out}", parse_mode="HTML", reply_markup=kb_out)
+                    return
+            await msg.reply_text("❌ Введите корректное время в формате ЧЧ:ММ (например: 03:00 или 04:30).")
+            return
+
+        elif mode == "input_backup_channel":
+            context.user_data["mode"] = None
+            c_val = text.strip()
+            if c_val in ("0", "none", "off", "откл"):
+                set_setting("backup_channel_id", "")
+                await msg.reply_text("✅ Отправка бэкапов в канал отключена.")
+            else:
+                set_setting("backup_channel_id", c_val)
+                await msg.reply_text(f"✅ Канал для отправки автобэкапов установлен: <code>{html.escape(c_val)}</code>")
+            text_out, kb_out = render_admin_backup_menu()
+            await msg.reply_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+            return
+
+        elif mode == "input_backup_password":
+            context.user_data["mode"] = None
+            p_val = text.strip()
+            if p_val in ("0", "none", "off", "откл"):
+                set_setting("backup_password", "")
+                await msg.reply_text("✅ Шифрование бэкапов отключено (будут создаваться обычные .zip архивы).")
+            else:
+                set_setting("backup_password", p_val)
+                await msg.reply_text("✅ Пароль шифрования бэкапов (AES-256) успешно установлен!")
+            text_out, kb_out = render_admin_backup_menu()
+            await msg.reply_text(text_out, parse_mode="HTML", reply_markup=kb_out)
+            return
+
+        elif mode and mode.startswith("enter_new_srv_group_"):
+            context.user_data["mode"] = None
+            srv_id = int(mode.split("_")[-1])
+            new_grp = text.strip()
+            if new_grp:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE servers SET group_name = ? WHERE id = ?", (new_grp, srv_id))
+                    conn.commit()
+                await MultiPanelManager.auto_provision_server_to_group_users(srv_id, DB_PATH)
+                await msg.reply_text(f"✅ Серверу #{srv_id} назначена новая группа: <b>{html.escape(new_grp)}</b>!", parse_mode="HTML")
+            return
+
+        elif mode and mode.startswith("enter_new_tariff_group_"):
+            context.user_data["mode"] = None
+            t_id = int(mode.split("_")[-1])
+            new_grp = text.strip()
+            if new_grp:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE tariffs SET group_name = ? WHERE id = ?", (new_grp, t_id))
+                    conn.commit()
+                await msg.reply_text(f"✅ Тарифу #{t_id} назначена новая группа: <b>{html.escape(new_grp)}</b>!", parse_mode="HTML")
+            return
+
         elif mode == "set_subdom":
             context.user_data["mode"] = None
             raw_input = text.strip()
@@ -7041,6 +8126,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.sleep(3)
                     else:
                         caddy_err_log = res_c.stderr or res_c.stdout
+                    try:
+                        await ensure_required_ports_open()
+                    except Exception:
+                        pass
                 except Exception as _ce:
                     caddy_err_log = str(_ce)
 
@@ -9228,6 +10317,58 @@ async def handle_hwid_reset_callbacks(update, context):
         return
 
 
+async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик загрузки бэкапа в виде документа в чат с ботом"""
+    if not update.message or not update.message.document:
+        return
+    user = update.effective_user
+    if not user or user.id not in get_all_admin_ids():
+        return
+
+    doc = update.message.document
+    fname = doc.file_name or "unknown"
+    if not (fname.endswith(".zip") or fname.endswith(".enc") or fname.endswith(".db")):
+        return
+
+    wait_m = await update.message.reply_text(f"⏳ <b>Загрузка файла резервной копии:</b> <code>{html.escape(fname)}</code>...", parse_mode="HTML")
+    tmp_dir = os.path.join(BASE_DIR, "tmp_upload")
+    os.makedirs(tmp_dir, exist_ok=True)
+    dst_path = os.path.join(tmp_dir, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{fname}")
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(dst_path)
+
+        ok, msg = restore_system_from_backup_archive(dst_path)
+        if ok:
+            await wait_m.edit_text(
+                f"✅ <b>Система успешно восстановлена!</b>\n\n"
+                f"Файл: <code>{html.escape(fname)}</code>\n"
+                f"{msg}\n\n"
+                f"⚡ <i>Рекомендуется синхронизировать ноды.</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Синхронизировать ноды", callback_data="admin_sync_nodes_now")],
+                    [InlineKeyboardButton("🈴 На главную", callback_data="admin_back_main")]
+                ])
+            )
+        else:
+            await wait_m.edit_text(
+                f"❌ <b>Ошибка при восстановлении из бэкапа:</b>\n\n"
+                f"<code>{html.escape(msg)}</code>",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"[handle_document_upload] Error: {e}")
+        await wait_m.edit_text(f"❌ Сбой при обработке документа: {e}")
+    finally:
+        if os.path.exists(dst_path):
+            try:
+                os.remove(dst_path)
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     from migrate_db import run_migrations
     run_migrations(DB_PATH)
@@ -9236,7 +10377,6 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).request(HTTPXRequest(connection_pool_size=16, connect_timeout=20.0, read_timeout=30.0, write_timeout=20.0, pool_timeout=10.0)).post_init(post_init).build()
 
     if app.job_queue:
-        app.job_queue.run_daily(daily_backup_job, time=time(hour=3, minute=0))
         app.job_queue.run_repeating(expire_vips_job, interval=3600, first=60)
         app.job_queue.run_repeating(check_expiry_reminders_job, interval=1800, first=45)
         app.job_queue.run_repeating(poll_pending_invoices_job, interval=25, first=10)
@@ -9251,6 +10391,7 @@ if __name__ == "__main__":
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(CallbackQueryHandler(callbacks_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 

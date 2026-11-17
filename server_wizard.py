@@ -226,8 +226,9 @@ def save_server_record(
             placeholders = ", ".join(["?"] * len(vals))
             cur.execute(f"INSERT INTO servers ({fields}) VALUES ({placeholders})", list(vals.values()))
             conn.commit()
+            last_id = cur.lastrowid
         conn.close()
-        return True
+        return last_id or True
     except Exception as e:
         print(f"Ошибка сохранения: {e}")
         return False
@@ -563,7 +564,7 @@ async def finalize_server_addition(update, context, wiz: dict, force: bool = Fal
             return
 
         host_port = extract_host_port(wpp_url)
-        save_server_record(
+        sid = save_server_record(
             name=wiz["name"],
             host=host_port,
             panel_url="",
@@ -575,8 +576,11 @@ async def finalize_server_addition(update, context, wiz: dict, force: bool = Fal
             group_name=wiz.get("group_name", "")
         )
         try:
-            from panel_manager import sync_active_keys_with_servers
+            from panel_manager import MultiPanelManager, sync_active_keys_with_servers
             asyncio.create_task(sync_active_keys_with_servers())
+            if isinstance(sid, int) and sid > 0:
+                asyncio.create_task(asyncio.to_thread(MultiPanelManager.scan_server_protocols, sid, get_db_path()))
+                asyncio.create_task(MultiPanelManager.auto_provision_server_to_group_users(sid, get_db_path()))
         except Exception:
             pass
         context.user_data.pop("srv_wiz", None)
@@ -632,7 +636,7 @@ async def finalize_server_addition(update, context, wiz: dict, force: bool = Fal
             return
 
         host_port = extract_host_port(url_3x)
-        save_server_record(
+        sid = save_server_record(
             name=wiz["name"],
             host=host_port,
             panel_url=url_3x,
@@ -644,8 +648,11 @@ async def finalize_server_addition(update, context, wiz: dict, force: bool = Fal
             group_name=wiz.get("group_name", "")
         )
         try:
-            from panel_manager import sync_active_keys_with_servers
+            from panel_manager import MultiPanelManager, sync_active_keys_with_servers
             asyncio.create_task(sync_active_keys_with_servers())
+            if isinstance(sid, int) and sid > 0:
+                asyncio.create_task(asyncio.to_thread(MultiPanelManager.scan_server_protocols, sid, get_db_path()))
+                asyncio.create_task(MultiPanelManager.auto_provision_server_to_group_users(sid, get_db_path()))
         except Exception:
             pass
         context.user_data.pop("srv_wiz", None)
@@ -698,7 +705,7 @@ async def finalize_server_addition(update, context, wiz: dict, force: bool = Fal
             return
 
         host_port = extract_host_port(url)
-        save_server_record(
+        sid = save_server_record(
             name=wiz["name"],
             host=host_port,
             panel_url=url,
@@ -709,8 +716,11 @@ async def finalize_server_addition(update, context, wiz: dict, force: bool = Fal
             group_name=wiz.get("group_name", "")
         )
         try:
-            from panel_manager import sync_active_keys_with_servers
+            from panel_manager import MultiPanelManager, sync_active_keys_with_servers
             asyncio.create_task(sync_active_keys_with_servers())
+            if isinstance(sid, int) and sid > 0:
+                asyncio.create_task(asyncio.to_thread(MultiPanelManager.scan_server_protocols, sid, get_db_path()))
+                asyncio.create_task(MultiPanelManager.auto_provision_server_to_group_users(sid, get_db_path()))
         except Exception:
             pass
         context.user_data.pop("srv_wiz", None)

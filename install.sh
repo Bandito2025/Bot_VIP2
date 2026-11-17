@@ -162,6 +162,58 @@ if [[ "$USE_EXISTING_ENV" != true ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────────
+#  Функции безопасности и настройки портов
+# ─────────────────────────────────────────────────────────────
+harden_file_permissions() {
+    chmod 0600 "$ENV_FILE" 2>/dev/null || true
+    chmod 0600 "$BACKUP_ENV" 2>/dev/null || true
+    if [[ -f "$BOT_DIR/bot_data.db" ]]; then
+        chmod 0600 "$BOT_DIR/bot_data.db" 2>/dev/null || true
+    fi
+    mkdir -p "$BOT_DIR/backups"
+    chmod 0700 "$BOT_DIR/backups" 2>/dev/null || true
+}
+
+open_required_firewall_ports() {
+    echo "🛡️ Настройка сетевого экрана (UFW/Iptables)..."
+    local sub_port="2097"
+    if [[ -f "$ENV_FILE" ]]; then
+        local env_sub_url
+        env_sub_url=$(grep -E '^[[:space:]]*SUB_BASE_URL=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]' | tr -d '"' | tr -d "'" || echo "")
+        local parsed_p
+        parsed_p=$(echo "$env_sub_url" | grep -oE ':[0-9]+' | tr -d ':' || echo "")
+        if [[ -n "$parsed_p" ]]; then
+            sub_port="$parsed_p"
+        fi
+    fi
+
+    if command -v ufw &>/dev/null; then
+        # Первым шагом всегда разрешаем 22/tcp для защиты от потери SSH-доступа
+        ufw allow 22/tcp || true
+        ufw --force enable || true
+        # Открываем базовый набор портов для VPN и подписок
+        ufw allow 80/tcp || true
+        ufw allow 443/tcp || true
+        ufw allow 443/udp || true
+        ufw allow 8443/tcp || true
+        ufw allow 8443/udp || true
+        if [[ -n "$sub_port" && "$sub_port" != "8443" && "$sub_port" != "443" && "$sub_port" != "80" ]]; then
+            ufw allow "${sub_port}/tcp" || true
+        fi
+    elif command -v iptables &>/dev/null; then
+        iptables -A INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+        iptables -A INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+        iptables -A INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
+        iptables -A INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || true
+        iptables -A INPUT -p tcp --dport 8443 -j ACCEPT 2>/dev/null || true
+        iptables -A INPUT -p udp --dport 8443 -j ACCEPT 2>/dev/null || true
+        if [[ -n "$sub_port" ]]; then
+            iptables -A INPUT -p tcp --dport "${sub_port}" -j ACCEPT 2>/dev/null || true
+        fi
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
 #  [1/4] Установка пакетов и веб-сервера Caddy
 # ─────────────────────────────────────────────────────────────
 echo "⏳ [1/4] Установка системных пакетов и Caddy..."
@@ -183,10 +235,7 @@ elif command -v yum &>/dev/null; then
     fi
 fi
 
-if command -v ufw &>/dev/null; then
-    ufw allow 80/tcp || true
-    ufw allow 8443/tcp || true
-fi
+open_required_firewall_ports
 
 # ─────────────────────────────────────────────────────────────
 #  [2/4] Загрузка / обновление исходного кода Bot_VIP2
@@ -254,12 +303,24 @@ cat > /usr/local/bin/bot-update << 'EOF'
 set -e
 echo "🔄 Запуск обновления Bot_VIP2..."
 cd /opt/Bot_VIP
-git pull origin main
+if command -v ufw &>/dev/null; then
+    ufw allow 22/tcp || true
+    ufw --force enable || true
+    ufw allow 80/tcp || true
+    ufw allow 443/tcp || true
+    ufw allow 443/udp || true
+    ufw allow 8443/tcp || true
+    ufw allow 8443/udp || true
+fi
+git pull --ff-only origin main
+/opt/Bot_VIP/venv/bin/pip install --quiet -r requirements.txt || true
 /opt/Bot_VIP/venv/bin/python3 migrate_db.py
 systemctl restart bot_vip caddy
 echo "✅ Bot_VIP2 успешно обновлен и перезапущен!"
 EOF
 chmod +x /usr/local/bin/bot-update 2>/dev/null || true
+
+harden_file_permissions
 
 cat > /etc/systemd/system/bot_vip.service << EOF
 [Unit]

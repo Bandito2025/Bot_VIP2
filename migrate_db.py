@@ -121,17 +121,37 @@ def run_migrations(db_path: str = None) -> bool:
                 key_id INTEGER NOT NULL,
                 server_id INTEGER NOT NULL,
                 panel_type TEXT DEFAULT '3xui',
+                inbound_id INTEGER DEFAULT 0,
                 remote_id TEXT DEFAULT '',
                 remote_email TEXT DEFAULT '',
                 up_bytes INTEGER DEFAULT 0,
                 down_bytes INTEGER DEFAULT 0,
                 is_active INTEGER DEFAULT 1,
                 updated_at TEXT,
-                UNIQUE(key_id, server_id, panel_type)
+                UNIQUE(key_id, server_id, panel_type, inbound_id)
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ukn_key ON user_key_nodes(key_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ukn_srv ON user_key_nodes(server_id);")
+
+        # server_inbounds
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS server_inbounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                inbound_id INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                remark TEXT,
+                port INTEGER,
+                network TEXT,
+                security TEXT,
+                stream_json TEXT,
+                is_active INTEGER DEFAULT 1,
+                updated_at TEXT,
+                UNIQUE(server_id, inbound_id)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_srv_inb_srv ON server_inbounds(server_id);")
 
         # tariffs
         cur.execute("""
@@ -394,6 +414,7 @@ def run_migrations(db_path: str = None) -> bool:
 
         # user_key_nodes
         add_cols_if_missing("user_key_nodes", {
+            "inbound_id": "INTEGER DEFAULT 0",
             "panel_type": "TEXT DEFAULT '3xui'",
             "remote_id": "TEXT DEFAULT ''",
             "remote_email": "TEXT DEFAULT ''",
@@ -402,6 +423,41 @@ def run_migrations(db_path: str = None) -> bool:
             "is_active": "INTEGER DEFAULT 1",
             "updated_at": "TEXT"
         })
+
+        # Безопасный апгрейд UNIQUE constraint user_key_nodes до (key_id, server_id, panel_type, inbound_id)
+        try:
+            sql_row = cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='user_key_nodes'").fetchone()
+            if sql_row and sql_row[0] and "inbound_id" not in sql_row[0].split("UNIQUE")[-1]:
+                cur.execute("""
+                    CREATE TABLE user_key_nodes_v2 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        key_id INTEGER NOT NULL,
+                        server_id INTEGER NOT NULL,
+                        panel_type TEXT DEFAULT '3xui',
+                        inbound_id INTEGER DEFAULT 0,
+                        remote_id TEXT DEFAULT '',
+                        remote_email TEXT DEFAULT '',
+                        up_bytes INTEGER DEFAULT 0,
+                        down_bytes INTEGER DEFAULT 0,
+                        is_active INTEGER DEFAULT 1,
+                        updated_at TEXT,
+                        UNIQUE(key_id, server_id, panel_type, inbound_id)
+                    );
+                """)
+                existing_cols = [c[1] for c in cur.execute("PRAGMA table_info(user_key_nodes)").fetchall()]
+                inb_expr = "inbound_id" if "inbound_id" in existing_cols else "0 AS inbound_id"
+                cur.execute(f"""
+                    INSERT OR IGNORE INTO user_key_nodes_v2 (id, key_id, server_id, panel_type, inbound_id, remote_id, remote_email, up_bytes, down_bytes, is_active, updated_at)
+                    SELECT id, key_id, server_id, panel_type, {inb_expr}, remote_id, remote_email, up_bytes, down_bytes, is_active, updated_at
+                    FROM user_key_nodes;
+                """)
+                cur.execute("DROP TABLE user_key_nodes;")
+                cur.execute("ALTER TABLE user_key_nodes_v2 RENAME TO user_key_nodes;")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_ukn_key ON user_key_nodes(key_id);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_ukn_srv ON user_key_nodes(server_id);")
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ukn_key_srv_panel_inb ON user_key_nodes(key_id, server_id, panel_type, inbound_id);")
+        except Exception as _e_ukn:
+            logger.warning(f"user_key_nodes constraint migration note: {_e_ukn}")
 
         # tariffs
         add_cols_if_missing("tariffs", {
@@ -444,8 +500,25 @@ def run_migrations(db_path: str = None) -> bool:
         except Exception as e:
             logger.warning(f"Ошибка авторазметки тарифов бота: {e}")
 
-                # Инициализация настроек по умолчанию
-        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('reissue_price', '100');")
+        # Нормализация group_name: пустые значения переводим в 'Основная'
+        try:
+            cur.execute("UPDATE servers SET group_name = 'Основная' WHERE group_name IS NULL OR TRIM(group_name) = '';")
+            cur.execute("UPDATE tariffs SET group_name = 'Основная' WHERE (group_name IS NULL OR TRIM(group_name) = '') AND (is_bot = 0 OR is_bot IS NULL);")
+            cur.execute("UPDATE user_keys SET group_name = 'Основная' WHERE group_name IS NULL OR TRIM(group_name) = '';")
+        except Exception as _e_grp:
+            logger.warning(f"Ошибка нормализации group_name: {_e_grp}")
+
+        # Инициализация настроек по умолчанию
+        default_settings = [
+            ('reissue_price', '100'),
+            ('auto_backup_enabled', '1'),
+            ('auto_backup_time', '03:00'),
+            ('auto_backup_keep_days', '14'),
+            ('backup_channel_id', ''),
+            ('backup_password', ''),
+        ]
+        for skey, sval in default_settings:
+            cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?);", (skey, sval))
         conn.commit()
         conn.close()
         logger.info(f"✅ Миграция БД успешно завершена для {target}")

@@ -1263,6 +1263,255 @@ async def test_full_e2e_user_lifecycle():
             except Exception:
                 pass
 
+# ------------------------------------------------------------------------------
+# 23. БЕЗОПАСНОСТЬ: .gitignore, ПРАВА ДОСТУПА И ПОЛНЫЙ ШИФРОВАННЫЙ БЭКАП
+# ------------------------------------------------------------------------------
+async def test_security_gitignore_permissions_and_full_backup():
+    print("\n🔐 23. Тест безопасности, прав доступа ОС и полного AES/Fernet бэкапа...")
+    try:
+        import bot
+
+        # 1. Проверка правил .gitignore
+        gi_path = os.path.join(BASE_DIR, ".gitignore")
+        gi_ok = os.path.exists(gi_path)
+        required_rules = [".env", ".env.*", "*.bak", "*.db", "*.db-wal", "*.db-shm", "*.sqlite", "*.zip", "*.enc", "backups/", ".update_notify.json"]
+        rules_present = True
+        if gi_ok:
+            with open(gi_path, "r", encoding="utf-8") as f:
+                gi_content = f.read()
+            for r in required_rules:
+                if r not in gi_content:
+                    rules_present = False
+                    break
+        report_step("Безопасность: .gitignore содержит все критические правила для публичного Git", gi_ok and rules_present)
+
+        # 2. Вызов harden_file_permissions (проверка без исключений)
+        try:
+            bot.harden_file_permissions()
+            perm_ok = True
+        except Exception:
+            perm_ok = False
+        report_step("Безопасность: функция harden_file_permissions() выполняется без ошибок", perm_ok)
+
+        # 3. Создание зашифрованного бэкапа с паролем
+        test_pwd = "MasterTestPassword_2026!"
+        enc_backup = bot.create_full_system_backup(reason="test_sec", password=test_pwd)
+        is_enc = os.path.exists(enc_backup) and enc_backup.endswith(".enc")
+        report_step("Полный бэкап: создание зашифрованного архива .zip.enc (AES-256 Fernet)", is_enc, f"Файл: {os.path.basename(enc_backup)}")
+
+        # 4. Проверка восстановления из зашифрованного бэкапа
+        ok_restore, res_msg = bot.restore_system_from_backup_archive(enc_backup, password=test_pwd)
+        report_step("Полный бэкап: успешная дешифровка, проверка manifest.json и целостности SQLite", ok_restore, res_msg)
+
+        # 5. Проверка отклонения при неверном пароле
+        bad_restore, _ = bot.restore_system_from_backup_archive(enc_backup, password="WrongPassword!")
+        report_step("Безопасность: отклонение восстановления при неверном пароле дешифровки", not bad_restore)
+
+        # Очистка тестового файла
+        if os.path.exists(enc_backup):
+            try:
+                os.remove(enc_backup)
+            except Exception:
+                pass
+    except Exception as e:
+        report_step("Безопасность и полные бэкапы", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 24. АВТОМАТИЧЕСКОЕ ОТКРЫТИЕ ПОРТОВ: install.sh И bot.py
+# ------------------------------------------------------------------------------
+async def test_install_sh_and_bot_auto_port_opening():
+    print("\n🛡 24. Тест автоматического открытия портов в install.sh и bot.py...")
+    try:
+        import bot
+
+        # 1. Проверка install.sh на наличие функции open_required_firewall_ports
+        inst_path = os.path.join(BASE_DIR, "install.sh")
+        has_sh = os.path.exists(inst_path)
+        has_ports_fn = False
+        if has_sh:
+            with open(inst_path, "r", encoding="utf-8") as f:
+                sh_code = f.read()
+            has_ports_fn = "open_required_firewall_ports" in sh_code and "22/tcp" in sh_code and "8443" in sh_code
+        report_step("Скрипт install.sh: наличие безопасной функции open_required_firewall_ports() (22, 80, 443, 8443, sub)", has_ports_fn)
+
+        # 2. Вызов ensure_required_ports_open() в bot.py
+        port_res = await bot.ensure_required_ports_open()
+        p_ok = isinstance(port_res, dict) and "status" in port_res
+        report_step("Сетевой стек bot.py: ensure_required_ports_open() сканирует базу и применяет правила фаервола", p_ok, f"Статус: {port_res.get('status')}")
+    except Exception as e:
+        report_step("Автоматическое открытие портов", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 25. САМООБНОВЛЕНИЕ БОТА ИЗ TELEGRAM: МАРКЕР, БЭКАП И ЭКРАН ОБНОВЛЕНИЯ
+# ------------------------------------------------------------------------------
+async def test_self_update_marker_and_backup():
+    print("\n🔄 25. Тест центра автообновления бота прямо из Telegram (Git Self-Update)...")
+    try:
+        import bot
+
+        # 1. Проверка получения текущего коммита
+        commit = bot.get_current_git_commit()
+        has_commit = bool(commit and len(commit) >= 4)
+        report_step("Git Self-Update: корректное получение текущего коммита репозитория", has_commit, f"Commit: {commit}")
+
+        # 2. Проверка генерации экрана обновлений
+        up_text, up_kb = bot.render_bot_update_screen()
+        has_up_btn = any(
+            any("admin_bot_update_run" in getattr(btn, "callback_data", "") for btn in row)
+            for row in up_kb.inline_keyboard
+        )
+        report_step("Центр обновлений: экран render_bot_update_screen() формирует кнопку 'admin_bot_update_run'", has_up_btn)
+
+        # 3. Проверка жизненного цикла маркера .update_notify.json
+        marker_p = os.path.join(BASE_DIR, ".update_notify.json")
+        test_payload = {
+            "chat_id": 5167074427,
+            "message_id": 9999,
+            "prev_commit": "abc1234",
+            "new_commit": "def5678",
+            "updated_at": "2026-11-17T12:00:00Z"
+        }
+        with open(marker_p, "w", encoding="utf-8") as f:
+            json.dump(test_payload, f)
+        report_step("Маркер обновления: создание файла .update_notify.json для уведомления админа после перезапуска", os.path.exists(marker_p))
+
+        # Чтение и очистка
+        with open(marker_p, "r", encoding="utf-8") as f:
+            read_back = json.load(f)
+        marker_valid = read_back.get("prev_commit") == "abc1234" and read_back.get("new_commit") == "def5678"
+        os.remove(marker_p)
+        report_step("Маркер обновления: валидность структуры данных и успешное удаление маркера", marker_valid and not os.path.exists(marker_p))
+    except Exception as e:
+        report_step("Самообновление бота", False, f"Исключение: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 26. МУЛЬТИПРОТОКОЛЬНОСТЬ (ДО 10+ НА НОДУ) И СТРОГАЯ ИЗОЛЯЦИЯ ГРУПП
+# ------------------------------------------------------------------------------
+async def test_multi_protocol_up_to_10_and_group_isolation():
+    print("\n🧩 26. Тест мультипротокольности (10+ протоколов) и строгой изоляции групп...")
+    test_db = os.path.join(BASE_DIR, "test_multi_proto.db")
+    try:
+        from migrate_db import run_migrations
+        run_migrations(test_db)
+
+        # 1. Проверка структуры server_inbounds и UNIQUE(key_id, server_id, panel_type, inbound_id)
+        with sqlite3.connect(test_db) as conn:
+            cur = conn.cursor()
+            inb_t = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_inbounds'").fetchone()
+            report_step("Мультипротокол: таблица server_inbounds успешно создана и мигрирована", bool(inb_t))
+
+            # Создаем тестовый сервер
+            cur.execute(
+                "INSERT INTO servers (name, host, panel_type, group_name, is_active) VALUES (?, ?, ?, ?, 1)",
+                ("Multi-Node 1", "node1.test:443", "3xui", "VIP")
+            )
+            srv_id = cur.lastrowid
+
+            # Добавляем 5 протоколов для этого сервера
+            protocols = [
+                (1, "vless", 443, "VLESS Reality"),
+                (2, "trojan", 8443, "Trojan TLS"),
+                (3, "vmess", 2083, "VMess WS"),
+                (4, "shadowsocks", 10001, "SS-2022"),
+                (5, "hysteria2", 443, "Hysteria2 UDP")
+            ]
+            for inb_id, proto, port, rem in protocols:
+                cur.execute(
+                    "INSERT INTO server_inbounds (server_id, inbound_id, protocol, port, remark, is_active) VALUES (?, ?, ?, ?, ?, 1)",
+                    (srv_id, inb_id, proto, port, rem)
+                )
+
+            # Проверяем привязку ключа ко всем 5 протоколам ноды
+            cur.execute("INSERT INTO users (user_id, username) VALUES (777001, 'proto_user')")
+            cur.execute("INSERT INTO user_keys (user_id, sub_id, expires_at, is_active) VALUES (777001, 'sub_multi', 2000000000, 1)")
+            key_id = cur.lastrowid
+
+            for inb_id, proto, port, rem in protocols:
+                cur.execute(
+                    "INSERT INTO user_key_nodes (key_id, server_id, panel_type, inbound_id, remote_id, remote_email, is_active) VALUES (?, ?, '3xui', ?, 'uuid', 'email', 1)",
+                    (key_id, srv_id, inb_id)
+                )
+            conn.commit()
+
+            count_links = cur.execute("SELECT COUNT(*) FROM user_key_nodes WHERE key_id = ?", (key_id,)).fetchone()[0]
+            report_step("Мультипротокол: успешная выдача 5 различных протоколов на одной ноде для одного ключа", count_links == 5)
+
+        # 2. Проверка строгой изоляции групп серверов
+        from panel_manager import get_servers_for_group
+        vip_servers = get_servers_for_group("VIP", test_db)
+        std_servers = get_servers_for_group("Стандарт", test_db)
+        report_step("Изоляция групп: VIP-сервер не попадает в выборку для группы 'Стандарт'", len(vip_servers) == 1 and len(std_servers) == 0)
+
+        # 3. Проверка формата генерации ссылок {server_name} · {remark or PROTOCOL}
+        from panel_manager import generate_3xui_link
+        inb_dict = {
+            "protocol": "hysteria2",
+            "port": 443,
+            "remark": "Hysteria2 Fast",
+            "streamSettings": {
+                "security": "tls",
+                "tlsSettings": {"serverName": "test.com"}
+            }
+        }
+        link_out = generate_3xui_link(
+            inb=inb_dict,
+            client_uuid="my_secret_token",
+            host="node1.test",
+            server_name="Multi-Node 1"
+        )
+        from urllib.parse import unquote
+        clean_link = unquote(link_out)
+        report_step("Формат ссылок подписки: имя ноды и протокол объединены через точку ({server_name} · {protocol})", "Multi-Node 1" in clean_link and "hysteria2://" in clean_link)
+
+    finally:
+        if os.path.exists(test_db):
+            try:
+                os.remove(test_db)
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------------------------
+# 27. ХАБ ПОЛЬЗОВАТЕЛЕЙ И АВТО-ВОССТАНОВЛЕНИЕ (БЭКАП / ПАНЕЛИ)
+# ------------------------------------------------------------------------------
+async def test_users_hub_and_auto_restore_backup_and_panels():
+    print("\n👥 27. Тест хаба пользователей, 8 метрик статистики и восстановления...")
+    try:
+        import bot
+
+        # 1. Проверка экрана Users Hub (8 метрик + 7 кнопок)
+        hub_text, hub_kb = bot.render_admin_users_hub()
+        has_stats = all(metric in hub_text for metric in ("Всего пользователей", "Активных подписок", "Истекших подписок", "Триал-пользователей", "Привлеченных рефералов", "Общий баланс", "Израсходованный трафик", "Активных ключей"))
+        report_step("Хаб пользователей: экран render_admin_users_hub() отображает все 8 ключевых метрик системы", has_stats)
+
+        required_hub_callbacks = [
+            "admin_users_list_all",
+            "admin_user_search",
+            "admin_restore_users_menu",
+            "admin_sync_db_to_panel",
+            "admin_smart_restore_from_panels",
+            "admin_sync_deleted_users",
+            "admin_back_main"
+        ]
+        all_cb_in_hub = [getattr(btn, "callback_data", "") for row in hub_kb.inline_keyboard for btn in row]
+        all_buttons_present = all(cb in all_cb_in_hub for cb in required_hub_callbacks)
+        report_step("Хаб пользователей: наличие всех 7 кнопок управления (список, поиск, бэкап, синхронизация, умное восстановление, очистка, меню)", all_buttons_present)
+
+        # 2. Проверка экрана управления бэкапами
+        b_text, b_kb = bot.render_admin_backup_menu()
+        has_backup_controls = all(ctrl in b_text for ctrl in ("Ежедневный автобэкап", "Время автобэкапа", "Хранить бэкапы", "Шифрование архивов"))
+        report_step("Меню бэкапов: render_admin_backup_menu() отображает статус расписания, глубину хранения и шифрование", has_backup_controls)
+
+        # 3. Проверка ротации старых архивов
+        bot.rotate_old_backups()
+        report_step("Ротация бэкапов: функция rotate_old_backups() успешно отрабатывает без ошибок", True)
+
+    except Exception as e:
+        report_step("Хаб пользователей и авто-восстановление", False, f"Исключение: {e}")
+
 async def main():
     print("=" * 70)
     print("🚀 ЗАПУСК КОМПЛЕКСНОГО СМОУК-ТЕСТА СИСТЕМЫ (Bot_VIP)")
@@ -1290,6 +1539,11 @@ async def main():
     await test_trial_followup_and_referral_admin()
     await test_all_inline_callbacks_have_handlers()
     await test_full_e2e_user_lifecycle()
+    await test_security_gitignore_permissions_and_full_backup()
+    await test_install_sh_and_bot_auto_port_opening()
+    await test_self_update_marker_and_backup()
+    await test_multi_protocol_up_to_10_and_group_isolation()
+    await test_users_hub_and_auto_restore_backup_and_panels()
     await test_live_panels()
 
     print("\n" + "=" * 70)

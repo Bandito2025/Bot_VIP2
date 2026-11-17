@@ -1,5 +1,9 @@
 import os
+import re
 import json
+import uuid
+import base64
+import secrets
 import sqlite3
 import logging
 import asyncio
@@ -34,10 +38,11 @@ def parse_stream_settings(raw_stream) -> dict:
             return {}
     return {}
 
-def generate_3xui_link(inb: dict, client_uuid: str, host: str, country_flag: str = "🇵🇱", default_flow: str = "xtls-rprx-vision") -> str:
+def generate_3xui_link(inb: dict, client_uuid: str, host: str, country_flag: str = "🇵🇱", default_flow: str = "xtls-rprx-vision", server_name: str = "") -> str:
     """
-    Генерация правильной ссылки подключения (VLESS, VMess, Trojan, Shadowsocks)
+    Генерация правильной ссылки подключения (VLESS, VMess, Trojan, Shadowsocks, Hysteria2)
     с полным извлечением параметров Reality pbk, sni, sid, spx и независимым разбором транспорта и безопасности.
+    Формат названия: {server_name} · {remark or protocol.upper()}
     """
     # 1. Проверка активности инбаунда
     if inb.get("enable") is False:
@@ -52,8 +57,15 @@ def generate_3xui_link(inb: dict, client_uuid: str, host: str, country_flag: str
     if not port:
         return ""
 
-    if country_flag and not remark.startswith(country_flag):
-        remark = f"{country_flag} {remark}".strip()
+    # Формируем читаемое имя: {server_name} · {remark or protocol.upper()}
+    if server_name:
+        clean_proto_label = remark if (remark and not remark.startswith("--!")) else proto.upper()
+        display_remark = f"{server_name} · {clean_proto_label}"
+    else:
+        display_remark = remark or proto.upper()
+
+    if country_flag and not display_remark.startswith(country_flag):
+        display_remark = f"{country_flag} {display_remark}".strip()
 
     stream = parse_stream_settings(inb.get("streamSettings"))
     net = str(stream.get("network") or "tcp").lower().strip()
@@ -88,6 +100,7 @@ def generate_3xui_link(inb: dict, client_uuid: str, host: str, country_flag: str
     if sec != "none":
         params.append(f"security={sec}")
 
+    sni = host
     if sec == "reality":
         real_sett = stream.get("realitySettings") or {}
         nested_sett = real_sett.get("settings") or {}
@@ -132,8 +145,42 @@ def generate_3xui_link(inb: dict, client_uuid: str, host: str, country_flag: str
         if proto == "vless" and net == "tcp":
             params.append(f"flow={default_flow}")
 
+    # 4. Протоколо-специфичная сборка URL
+    if proto == "trojan":
+        query_str = "&".join(params)
+        return f"trojan://{client_uuid}@{host}:{port}?{query_str}#{urllib.parse.quote(display_remark)}"
+    elif proto == "shadowsocks":
+        sett = parse_stream_settings(inb.get("settings"))
+        method = sett.get("method") or "aes-256-gcm"
+        b64_creds = base64.b64encode(f"{method}:{client_uuid}".encode()).decode().rstrip("=")
+        return f"ss://{b64_creds}@{host}:{port}#{urllib.parse.quote(display_remark)}"
+    elif proto == "hysteria2":
+        return f"hysteria2://{client_uuid}@{host}:{port}?sni={sni}&insecure=1#{urllib.parse.quote(display_remark)}"
+    elif proto == "vmess":
+        vmess_path = ""
+        if net == "ws":
+            vmess_path = (stream.get("wsSettings") or {}).get("path", "/")
+        elif net in ("http", "h2", "xhttp"):
+            vmess_path = (stream.get("httpSettings") or stream.get("xhttpSettings") or {}).get("path", "/")
+        vmess_obj = {
+            "v": "2",
+            "ps": display_remark,
+            "add": host,
+            "port": int(port),
+            "id": client_uuid,
+            "aid": 0,
+            "scy": "auto",
+            "net": net,
+            "type": "none",
+            "host": sni if sec != "none" else "",
+            "path": vmess_path,
+            "tls": sec if sec != "none" else ""
+        }
+        b64_vmess = base64.b64encode(json.dumps(vmess_obj, ensure_ascii=False).encode()).decode()
+        return f"vmess://{b64_vmess}"
+
     query_str = "&".join(params)
-    return f"{proto}://{client_uuid}@{host}:{port}?{query_str}#{urllib.parse.quote(remark)}"
+    return f"{proto}://{client_uuid}@{host}:{port}?{query_str}#{urllib.parse.quote(display_remark)}"
 
 
 class XUIAdapter:
@@ -381,16 +428,28 @@ class MultiPanelManager:
                 adapter = XUIAdapter(panel_url, srv.get("panel_user", ""), srv.get("panel_pass", ""))
                 ok, msg = await adapter.add_or_update_client(client_uuid, email, sub_id, expiry_ms=expiry_ms)
                 inbounds = await adapter.get_inbounds()
+                srv_name = srv.get("name") or "Сервер"
                 for inb in inbounds:
-                    link = generate_3xui_link(inb, client_uuid, server_host, country_flag)
+                    if inb.get("enable") is False:
+                        continue
+                    link = generate_3xui_link(inb, client_uuid, server_host, country_flag, server_name=srv_name)
                     if link:
                         generated.append(link)
-                node_entries.append({
-                    "server_id": srv_id,
-                    "panel_type": "3xui",
-                    "remote_id": client_uuid,
-                    "remote_email": email
-                })
+                    node_entries.append({
+                        "server_id": srv_id,
+                        "panel_type": "3xui",
+                        "inbound_id": inb.get("id", 0),
+                        "remote_id": client_uuid,
+                        "remote_email": email
+                    })
+                if not node_entries:
+                    node_entries.append({
+                        "server_id": srv_id,
+                        "panel_type": "3xui",
+                        "inbound_id": 0,
+                        "remote_id": client_uuid,
+                        "remote_email": email
+                    })
             except Exception as e:
                 logger.warning(f"Failed provisioning on 3X-UI node {srv.get('name')}: {e}")
 
@@ -418,6 +477,7 @@ class MultiPanelManager:
                                 node_entries.append({
                                     "server_id": srv_id,
                                     "panel_type": "wpp",
+                                    "inbound_id": 0,
                                     "remote_id": str(prof.get("id") or f"{user_id}_{key_id}"),
                                     "remote_email": email
                                 })
@@ -425,6 +485,7 @@ class MultiPanelManager:
                             node_entries.append({
                                 "server_id": srv_id,
                                 "panel_type": "wpp",
+                                "inbound_id": 0,
                                 "remote_id": f"{user_id}_{key_id}",
                                 "remote_email": email
                             })
@@ -440,6 +501,7 @@ class MultiPanelManager:
                             node_entries.append({
                                 "server_id": srv_id,
                                 "panel_type": "wpp",
+                                "inbound_id": 0,
                                 "remote_id": str(prof.get("id") or f"{user_id}_{key_id}"),
                                 "remote_email": email
                             })
@@ -447,6 +509,7 @@ class MultiPanelManager:
                         node_entries.append({
                             "server_id": srv_id,
                             "panel_type": "wpp",
+                            "inbound_id": 0,
                             "remote_id": f"{user_id}_{key_id}",
                             "remote_email": email
                         })
@@ -537,11 +600,291 @@ class MultiPanelManager:
 
         return True
 
+    @classmethod
+    async def scan_server_protocols(cls, server_id: int, db_path: str = None) -> dict:
+        """
+        Запрашивает /panel/api/inbounds/list в 3X-UI и сохраняет ВСЕ включенные инбаунды
+        (до 10+ штук: VLESS Reality/XHTTP/gRPC/WS, Trojan, VMess, Shadowsocks, Hysteria2 и др.)
+        в таблицу server_inbounds с полным разбором streamSettings.
+        Удаленные в панели инбаунды переводит в is_active = 0.
+        Проверяет доступность WPP.
+        Автоматически передает порты всех активных протоколов в ensure_required_ports_open().
+        """
+        p = db_path or DB_PATH
+        stats = {
+            "server_id": server_id,
+            "inbounds_found": 0,
+            "active_inbounds": 0,
+            "wpp_online": False,
+            "protocols": []
+        }
+        if not os.path.exists(p):
+            return stats
+
+        with get_db_conn(p) as conn:
+            row = conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
+            if not row:
+                return stats
+            srv = cls.normalize_server_dict(row)
+
+        p_type = str(srv.get("panel_type") or "3xui").lower()
+        panel_url = srv.get("panel_url", "").strip()
+
+        # 1. Скан 3X-UI инбаундов
+        if p_type in ("3xui", "3x-ui", "both") and panel_url:
+            try:
+                adapter = XUIAdapter(panel_url, srv.get("panel_user", ""), srv.get("panel_pass", ""))
+                inbounds = await adapter.get_inbounds()
+                stats["inbounds_found"] = len(inbounds)
+                found_inb_ids = set()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                with get_db_conn(p) as conn:
+                    for inb in inbounds:
+                        inb_id = inb.get("id")
+                        if not inb_id:
+                            continue
+                        found_inb_ids.add(inb_id)
+                        proto = str(inb.get("protocol") or "vless").lower().strip()
+                        remark = str(inb.get("remark") or "").strip()
+                        port = inb.get("port")
+                        is_act = 1 if inb.get("enable") is not False else 0
+                        stream = parse_stream_settings(inb.get("streamSettings"))
+                        net = str(stream.get("network") or "tcp").lower().strip()
+                        sec = str(stream.get("security") or "none").lower().strip()
+                        stream_json = json.dumps(stream, ensure_ascii=False)
+
+                        if is_act:
+                            stats["active_inbounds"] += 1
+                            if proto not in stats["protocols"]:
+                                stats["protocols"].append(proto)
+
+                        conn.execute("""
+                            INSERT INTO server_inbounds (server_id, inbound_id, protocol, remark, port, network, security, stream_json, is_active, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(server_id, inbound_id) DO UPDATE SET
+                                protocol=excluded.protocol,
+                                remark=excluded.remark,
+                                port=excluded.port,
+                                network=excluded.network,
+                                security=excluded.security,
+                                stream_json=excluded.stream_json,
+                                is_active=excluded.is_active,
+                                updated_at=excluded.updated_at
+                        """, (server_id, inb_id, proto, remark, port, net, sec, stream_json, is_act, now_str))
+
+                    # Деактивация отсутствующих
+                    if found_inb_ids:
+                        ph = ",".join("?" * len(found_inb_ids))
+                        conn.execute(
+                            f"UPDATE server_inbounds SET is_active = 0, updated_at = ? WHERE server_id = ? AND inbound_id NOT IN ({ph})",
+                            (now_str, server_id, *found_inb_ids)
+                        )
+                    conn.commit()
+            except Exception as e:
+                logger.warning(f"Error scanning 3X-UI protocols for server #{server_id}: {e}")
+
+        # 2. Проверка WPP
+        if p_type in ("wpp", "web_panel_proxy", "both"):
+            try:
+                wpp = WPPClient(server=srv)
+                res = await wpp.get_profile_traffic_async("health_probe_check")
+                stats["wpp_online"] = isinstance(res, dict)
+                if stats["wpp_online"] and "wpp" not in stats["protocols"]:
+                    stats["protocols"].append("wpp")
+            except Exception as e:
+                logger.debug(f"WPP probe for server #{server_id}: {e}")
+
+        # 3. Автооткрытие портов для найденных протоколов
+        try:
+            import importlib
+            bot_mod = importlib.import_module("bot")
+            if hasattr(bot_mod, "ensure_required_ports_open"):
+                await bot_mod.ensure_required_ports_open(db_path=p)
+        except Exception as _e_ports:
+            logger.debug(f"Port opening trigger note: {_e_ports}")
+
+        return stats
+
+    @classmethod
+    async def smart_restore_users_from_panels(cls, db_path: str = None) -> dict:
+        """
+        Опрашивает всех клиентов на активных нодах 3X-UI и WPP, парсит Telegram user_id
+        (user_<id>, tg_<id>, <id>_..., u<id>), восстанавливает недостающих пользователей в users
+        (не затирая существующие балансы), ключи в user_keys с реальными сроками expires_at
+        и привязки в user_key_nodes с точным inbound_id.
+        """
+        p = db_path or DB_PATH
+        stats = {"users_restored": 0, "keys_restored": 0, "nodes_linked": 0}
+        if not os.path.exists(p):
+            return stats
+
+        with get_db_conn(p) as conn:
+            srv_rows = conn.execute("SELECT * FROM servers WHERE is_active = 1").fetchall()
+            active_servers = [cls.normalize_server_dict(r) for r in srv_rows]
+
+        id_patterns = [
+            re.compile(r'user_(\d+)_k(\d+)'),
+            re.compile(r'user_(\d+)'),
+            re.compile(r'tg_(\d+)'),
+            re.compile(r'^(\d{6,12})_'),
+            re.compile(r'^u(\d{6,12})'),
+            re.compile(r'(\d{6,12})')
+        ]
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for srv in active_servers:
+            sid = srv["id"]
+            ptype = str(srv.get("panel_type") or "3xui").lower()
+            purl = srv.get("panel_url", "")
+            s_grp = srv.get("group_name") or "Основная"
+
+            # 1. Сканируем 3X-UI
+            if ptype in ("3xui", "3x-ui", "both") and purl:
+                try:
+                    adapter = XUIAdapter(purl, srv.get("panel_user", ""), srv.get("panel_pass", ""))
+                    inbounds = await adapter.get_inbounds()
+                    for inb in inbounds:
+                        inb_id = inb.get("id", 0)
+                        sett = parse_stream_settings(inb.get("settings"))
+                        clients = sett.get("clients") or []
+                        c_stats_list = inb.get("clientStats") or []
+                        stats_map = {cs.get("email"): cs for cs in c_stats_list if cs.get("email")}
+
+                        for cl in clients:
+                            cid = cl.get("id") or str(uuid.uuid4())
+                            email = str(cl.get("email") or "")
+                            sub_id = cl.get("subId") or secrets.token_hex(6)
+                            expiry_ms = int(cl.get("expiryTime") or 0)
+                            cs = stats_map.get(email, {})
+                            up = int(cs.get("up") or 0)
+                            down = int(cs.get("down") or 0)
+
+                            uid = 0
+                            kid = 0
+                            for pat in id_patterns:
+                                m = pat.search(email)
+                                if m:
+                                    uid = int(m.group(1))
+                                    if len(m.groups()) >= 2 and m.group(2):
+                                        try:
+                                            kid = int(m.group(2))
+                                        except Exception:
+                                            pass
+                                    break
+                            if not uid:
+                                continue
+
+                            exp_str = "Без срока"
+                            if expiry_ms > 0:
+                                exp_str = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+                            with get_db_conn(p) as conn:
+                                u_exist = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (uid,)).fetchone()
+                                if not u_exist:
+                                    conn.execute("""
+                                        INSERT INTO users (user_id, username, first_name, joined_at, is_vip, vip_until, client_uuid, sub_id, balance)
+                                        VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0)
+                                    """, (uid, f"restored_{uid}", "Восстановлен", now_str, exp_str, cid, sub_id))
+                                    stats["users_restored"] += 1
+
+                                k_row = None
+                                if kid:
+                                    k_row = conn.execute("SELECT id FROM user_keys WHERE id = ?", (kid,)).fetchone()
+                                if not k_row:
+                                    k_row = conn.execute("SELECT id FROM user_keys WHERE user_id = ? AND (client_uuid = ? OR sub_id = ?)", (uid, cid, sub_id)).fetchone()
+
+                                if not k_row:
+                                    cur_k = conn.execute("""
+                                        INSERT INTO user_keys (user_id, key_name, client_uuid, sub_id, server_id, group_name, expires_at, config_text, is_active, created_at)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, '', 1, ?)
+                                    """, (uid, f"🔑 Ключ #{uid}", cid, sub_id, sid, s_grp, exp_str, now_str))
+                                    actual_kid = cur_k.lastrowid
+                                    stats["keys_restored"] += 1
+                                else:
+                                    actual_kid = k_row[0]
+
+                                conn.execute("""
+                                    INSERT INTO user_key_nodes (key_id, server_id, panel_type, inbound_id, remote_id, remote_email, up_bytes, down_bytes, is_active, updated_at)
+                                    VALUES (?, ?, '3xui', ?, ?, ?, ?, ?, 1, ?)
+                                    ON CONFLICT(key_id, server_id, panel_type, inbound_id) DO UPDATE SET
+                                        remote_id=excluded.remote_id,
+                                        remote_email=excluded.remote_email,
+                                        up_bytes=excluded.up_bytes,
+                                        down_bytes=excluded.down_bytes,
+                                        is_active=1,
+                                        updated_at=excluded.updated_at
+                                """, (actual_kid, sid, inb_id, cid, email, up, down, now_str))
+                                stats["nodes_linked"] += 1
+                                conn.commit()
+                except Exception as e:
+                    logger.warning(f"smart_restore_users 3X-UI error on {srv.get('name')}: {e}")
+
+            # 2. Сканируем WPP
+            if ptype in ("wpp", "web_panel_proxy", "both"):
+                try:
+                    wpp = WPPClient(server=srv)
+                    profiles = []
+                    if hasattr(wpp, "get_profiles_async"):
+                        try:
+                            profiles = await wpp.get_profiles_async()
+                        except Exception:
+                            pass
+                    if profiles and isinstance(profiles, list):
+                        for prof in profiles:
+                            prof_id = str(prof.get("id") or "")
+                            p_name = str(prof.get("name") or "")
+                            uid = 0
+                            for pat in id_patterns:
+                                m = pat.search(p_name) or pat.search(prof_id)
+                                if m:
+                                    uid = int(m.group(1))
+                                    break
+                            if not uid:
+                                continue
+
+                            with get_db_conn(p) as conn:
+                                u_exist = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (uid,)).fetchone()
+                                if not u_exist:
+                                    conn.execute("""
+                                        INSERT INTO users (user_id, username, first_name, joined_at, is_vip, client_uuid, sub_id, balance)
+                                        VALUES (?, ?, ?, ?, 1, ?, ?, 0)
+                                    """, (uid, f"restored_{uid}", "Восстановлен", now_str, prof_id, secrets.token_hex(6)))
+                                    stats["users_restored"] += 1
+
+                                k_row = conn.execute("SELECT id FROM user_keys WHERE user_id = ?", (uid,)).fetchone()
+                                if not k_row:
+                                    cur_k = conn.execute("""
+                                        INSERT INTO user_keys (user_id, key_name, client_uuid, sub_id, server_id, group_name, expires_at, config_text, is_active, created_at)
+                                        VALUES (?, ?, ?, ?, ?, ?, 'Без срока', '', 1, ?)
+                                    """, (uid, f"🔑 WPP Ключ #{uid}", prof_id, secrets.token_hex(6), sid, s_grp, now_str))
+                                    actual_kid = cur_k.lastrowid
+                                    stats["keys_restored"] += 1
+                                else:
+                                    actual_kid = k_row[0]
+
+                                conn.execute("""
+                                    INSERT INTO user_key_nodes (key_id, server_id, panel_type, inbound_id, remote_id, remote_email, is_active, updated_at)
+                                    VALUES (?, ?, 'wpp', 0, ?, ?, 1, ?)
+                                    ON CONFLICT(key_id, server_id, panel_type, inbound_id) DO UPDATE SET
+                                        remote_id=excluded.remote_id,
+                                        is_active=1,
+                                        updated_at=excluded.updated_at
+                                """, (actual_kid, sid, prof_id, f"user_{uid}_wpp", now_str))
+                                stats["nodes_linked"] += 1
+                                conn.commit()
+                except Exception as e:
+                    logger.debug(f"smart_restore_users WPP on {srv.get('name')}: {e}")
+
+        logger.info(f"smart_restore_users_from_panels complete: {stats}")
+        return stats
+
 
 def get_servers_for_group(group_name: str = "", db_path: str = None) -> list[dict]:
     """
     Возвращает список активных серверов, соответствующих группе тарифа.
-    Строгая изоляция: клиенты группы 'Стандарт' не получают ноды из 'VIP'/'Proxy'.
+    Строгая изоляция: клиенты группы тарифа не получают ноды из других групп.
     """
     p = db_path or DB_PATH
     if not os.path.exists(p):
@@ -559,20 +902,112 @@ def get_servers_for_group(group_name: str = "", db_path: str = None) -> list[dic
         for s in all_active:
             s_grp = (s.get("group_name") or "").strip()
             groups = [g.strip() for g in s_grp.split(",") if g.strip()]
-            if grp in groups:
+            if grp == s_grp or grp in groups:
                 matched.append(s)
         if matched:
             return matched
 
-        # Фоллбэк только на неназначенные/общедоступные серверы
-        unassigned = [
-            s for s in all_active
-            if not s.get("group_name") or s.get("group_name").strip() in ("", "Все", "Общие")
-        ]
-        if unassigned:
-            return unassigned
-
         return []
+
+
+async def auto_provision_server_to_group_users(server_id: int, db_path: str = None, notify_callback = None) -> dict:
+    """
+    Находит все активные неистёкшие ключи, чей тариф относится к группе сервера,
+    и через asyncio.Semaphore(5) автоматически довыдаёт им все недостающие активные протоколы этого сервера.
+    """
+    p = db_path or DB_PATH
+    stats = {"processed": 0, "provisioned": 0, "errors": 0}
+    if not os.path.exists(p):
+        return stats
+
+    with get_db_conn(p) as conn:
+        s_row = conn.execute("SELECT * FROM servers WHERE id = ? AND is_active = 1", (server_id,)).fetchone()
+        if not s_row:
+            return stats
+        srv = MultiPanelManager.normalize_server_dict(s_row)
+        srv_grp = (srv.get("group_name") or "Основная").strip()
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        keys_rows = conn.execute("""
+            SELECT id, user_id, client_uuid, sub_id, group_name, expires_at, config_text
+            FROM user_keys
+            WHERE is_active = 1 AND (expires_at = 'Без срока' OR expires_at > ?)
+        """, (now_str,)).fetchall()
+        matching_keys = []
+        for k in keys_rows:
+            k_grp = (k["group_name"] or "Основная").strip()
+            k_groups = [g.strip() for g in k_grp.split(",") if g.strip()]
+            if k_grp == srv_grp or srv_grp in k_groups:
+                matching_keys.append(dict(k))
+
+    if not matching_keys:
+        return stats
+
+    sem = asyncio.Semaphore(5)
+
+    async def _provision_key(key_dict):
+        async with sem:
+            kid = key_dict["id"]
+            uid = key_dict["user_id"]
+            uuid_str = key_dict["client_uuid"]
+            sub_id = key_dict["sub_id"]
+            exp_str = key_dict["expires_at"] or ""
+            old_config = key_dict["config_text"] or ""
+
+            expiry_ms = 0
+            if exp_str and exp_str != "Без срока":
+                try:
+                    exp_clean = exp_str.split(".")[0]
+                    dt_fmt = "%Y-%m-%d %H:%M:%S" if " " in exp_clean else "%Y-%m-%d"
+                    exp_dt = datetime.strptime(exp_clean, dt_fmt)
+                    expiry_ms = int(exp_dt.timestamp() * 1000)
+                except Exception:
+                    pass
+
+            try:
+                res = await MultiPanelManager.provision_on_server(
+                    srv, uid, kid, uuid_str, sub_id, expiry_ms
+                )
+                with get_db_conn(p) as conn:
+                    cur_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    for ne in res.node_entries:
+                        ptype = ne.get("panel_type", "3xui")
+                        inb_id = ne.get("inbound_id", 0)
+                        rid = ne.get("remote_id", "")
+                        remail = ne.get("remote_email", f"user_{uid}_k{kid}")
+                        conn.execute("""
+                            INSERT INTO user_key_nodes (key_id, server_id, panel_type, inbound_id, remote_id, remote_email, is_active, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                            ON CONFLICT(key_id, server_id, panel_type, inbound_id) DO UPDATE SET
+                                remote_id=excluded.remote_id,
+                                remote_email=excluded.remote_email,
+                                is_active=1,
+                                updated_at=excluded.updated_at
+                        """, (kid, server_id, ptype, inb_id, rid, remail, cur_now))
+
+                    if res.links:
+                        existing_links = [l.strip() for l in old_config.splitlines() if l.strip()]
+                        for lk in res.links:
+                            if lk not in existing_links:
+                                existing_links.append(lk)
+                        new_cfg = "\n".join(existing_links).strip()
+                        conn.execute("UPDATE user_keys SET config_text = ? WHERE id = ?", (new_cfg, kid))
+                    conn.commit()
+
+                stats["provisioned"] += 1
+                if notify_callback and callable(notify_callback):
+                    try:
+                        await notify_callback(uid, kid, srv)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"Error auto-provisioning key #{kid} for server #{server_id}: {e}")
+                stats["errors"] += 1
+
+    tasks = [_provision_key(k) for k in matching_keys]
+    await asyncio.gather(*tasks)
+    stats["processed"] = len(matching_keys)
+    return stats
 
 
 async def sync_active_keys_with_servers(db_path: str = None) -> dict:
@@ -652,11 +1087,12 @@ async def sync_active_keys_with_servers(db_path: str = None) -> dict:
                     with get_db_conn(p) as conn:
                         for ne in res.node_entries:
                             p_type = ne.get("panel_type", "3xui")
+                            inb_id = ne.get("inbound_id", 0)
                             r_id = ne.get("remote_id", "")
                             r_email = ne.get("remote_email", f"user_{user_id}_k{k_id}")
                             cur = conn.execute(
-                                "SELECT id FROM user_key_nodes WHERE key_id = ? AND server_id = ? AND panel_type = ?",
-                                (k_id, sid, p_type)
+                                "SELECT id FROM user_key_nodes WHERE key_id = ? AND server_id = ? AND panel_type = ? AND inbound_id = ?",
+                                (k_id, sid, p_type, inb_id)
                             )
                             exist_row = cur.fetchone()
                             if exist_row:
@@ -666,8 +1102,8 @@ async def sync_active_keys_with_servers(db_path: str = None) -> dict:
                                 )
                             else:
                                 conn.execute(
-                                    "INSERT INTO user_key_nodes (key_id, server_id, panel_type, remote_id, remote_email, is_active, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
-                                    (k_id, sid, p_type, r_id, r_email, now_str)
+                                    "INSERT INTO user_key_nodes (key_id, server_id, panel_type, inbound_id, remote_id, remote_email, is_active, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                                    (k_id, sid, p_type, inb_id, r_id, r_email, now_str)
                                 )
                         conn.commit()
 
